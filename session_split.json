@@ -1,0 +1,47 @@
+{
+  "seed": 42,
+  "train_fraction": 0.7142857142857143,
+  "validation_fraction": 0.14285714285714285,
+  "test_fraction": 0.14285714285714285,
+  "train": [
+    "sessions ()\\session_ambiguous10_1787755150.npz",
+    "sessions ()\\session_ambiguous1_1787665758.npz",
+    "sessions ()\\session_ambiguous2_1787665844.npz",
+    "sessions ()\\session_ambiguous5_1787667094.npz",
+    "sessions ()\\session_ambiguous7_1787754937.npz",
+    "sessions ()\\session_ambiguous8_1787754976.npz",
+    "sessions ()\\session_ambiguous9_1787755025.npz",
+    "sessions ()\\session_dangerous10_1787841271.npz",
+    "sessions ()\\session_dangerous1_1787841443.npz",
+    "sessions ()\\session_dangerous22_1787846266.npz",
+    "sessions ()\\session_dangerous23_1787846289.npz",
+    "sessions ()\\session_dangerous24_1787846313.npz",
+    "sessions ()\\session_dangerous2_1787840773.npz",
+    "sessions ()\\session_dangerous3_1787840835.npz",
+    "sessions ()\\session_dangerous4_1787840910.npz",
+    "sessions ()\\session_dangerous6_1787841007.npz",
+    "sessions ()\\session_dangerous8_1787841176.npz",
+    "sessions ()\\session_dangerous9_1787841235.npz",
+    "sessions ()\\session_safe2_1787496914.npz",
+    "sessions ()\\session_safe3_1787497001.npz",
+    "sessions ()\\session_safe5_1787665480.npz",
+    "sessions ()\\session_safe6_1787845625.npz",
+    "sessions ()\\session_safe7_1787845661.npz",
+    "sessions ()\\session_safe8_1787845701.npz",
+    "sessions ()\\session_safe9_1787845727.npz"
+  ],
+  "validation": [
+    "sessions ()\\session_ambiguous4_1787667060.npz",
+    "sessions ()\\session_dangerous25_1787846331.npz",
+    "sessions ()\\session_dangerous5_1787840984.npz",
+    "sessions ()\\session_dangerous7_1787841064.npz",
+    "sessions ()\\session_safe10_1787845758.npz"
+  ],
+  "test": [
+    "sessions ()\\session_ambiguous3_1787666115.npz",
+    "sessions ()\\session_ambiguous6_1787754900.npz",
+    "sessions ()\\session_dangerous21_1787846248.npz",
+    "sessions ()\\session_safe1_1787496843.npz",
+    "sessions ()\\session_safe4_1787665424.npz"
+  ]
+}

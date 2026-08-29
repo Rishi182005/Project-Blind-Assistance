@@ -1,0 +1,52 @@
+# =========================
+# Python / environments
+# =========================
+__pycache__/
+*.py[cod]
+nav_env/
+.venv/
+venv/
+
+# =========================
+# Recorded / generated data
+# =========================
+og_sessions/
+sessions/
+sessions ()/
+*.npz
+*.npy
+
+# =========================
+# Large model weights
+# =========================
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# =========================
+# External cloned repositories
+# =========================
+MiDaS/
+Depth-Anything-V2/
+
+# =========================
+# OpenVINO generated files
+# =========================
+depth_openvino/
+
+# =========================
+# Intermediate model checkpoints
+# =========================
+risk_gru_model.keras
+risk_gru_model_finetuned.keras
+
+# Keep:
+# risk_gru_model_final.keras
+
+# =========================
+# Misc
+# =========================
+*.log
+.vscode/
+.idea/
