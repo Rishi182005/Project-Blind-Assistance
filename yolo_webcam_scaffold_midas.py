@@ -26,7 +26,6 @@ import threading
 from collections import deque
 import numpy as np
 import cv2
-from ultralytics import YOLO
 from tensorflow import keras
 import openvino as ov
 from pathlib import Path
@@ -72,7 +71,14 @@ class LatestFrameReader:
 
 # ---- config ----
 SOURCE = "http://192.168.29.115:8080/video"   # phone IP-cam stream; 0 = default webcam
-MODEL = "yolov8n.pt"
+MODEL = "yolov8n.pt"  # kept for reference/documentation
+YOLO_OPENVINO_MODEL = "yolov8n_openvino_model/yolov8n.xml"
+YOLO_DEVICE = "GPU"
+YOLO_INPUT_SIZE = 256
+
+# Match the confidence/NMS style of a normal YOLO detection pipeline.
+YOLO_CONF_THRESHOLD = 0.25
+YOLO_NMS_IOU = 0.45
 MAX_RANGE = 4.0
 CLASS_MAP = {
     "person": "person",
@@ -92,7 +98,7 @@ CLASS_MAP = {
 
 INFERENCE_IMGSZ = 256             # resolution YOLO actually runs inference at --
                                    # lower = faster, less accurate on small objects.
-                                   # Ultralytics rescales detected boxes back to the
+                                   # OpenVINO decoding rescales detected boxes back to the
                                    # ORIGINAL frame size automatically, so area_frac
                                    # (and CALIBRATION_K) stay valid at native res --
                                    # this only speeds up inference, doesn't touch
@@ -376,6 +382,195 @@ def predict_live_risk(gru_model, sequence_buffer):
     return float(np.clip(risk, 0.0, 1.0))
 
 
+
+COCO_NAMES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep",
+    "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+    "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "dining table", "toilet", "tv",
+    "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+    "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+    "scissors", "teddy bear", "hair drier", "toothbrush"
+]
+
+
+def load_yolo_openvino():
+    """Load the exported YOLOv8n OpenVINO model on the Intel GPU."""
+    model_path = Path(YOLO_OPENVINO_MODEL)
+
+    if not model_path.exists():
+        raise RuntimeError(
+            f"YOLO OpenVINO model not found:\n{model_path}\n"
+            "Export yolov8n.pt to OpenVINO at 256x256 first."
+        )
+
+    core = ov.Core()
+
+    if YOLO_DEVICE not in core.available_devices:
+        raise RuntimeError(
+            f"OpenVINO device '{YOLO_DEVICE}' is unavailable. "
+            f"Available devices: {core.available_devices}"
+        )
+
+    model = core.read_model(model_path)
+    compiled = core.compile_model(model, YOLO_DEVICE)
+
+    input_layer = compiled.input(0)
+    output_layer = compiled.output(0)
+
+    print(f"Loaded YOLOv8n OpenVINO: {model_path}")
+    print(f"YOLO device: {YOLO_DEVICE}")
+    print(f"YOLO input shape: {input_layer.shape}")
+    print(f"YOLO output shape: {output_layer.shape}")
+
+    return compiled, input_layer, output_layer
+
+
+def preprocess_yolo_openvino(frame):
+    """BGR OpenCV frame -> normalized NCHW tensor."""
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    rgb = cv2.resize(
+        rgb,
+        (YOLO_INPUT_SIZE, YOLO_INPUT_SIZE),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    rgb = rgb.astype(np.float32) / 255.0
+
+    tensor = np.transpose(
+        rgb,
+        (2, 0, 1),
+    )[None, ...]
+
+    return tensor.astype(np.float32)
+
+
+def infer_yolo_openvino(compiled_model, output_layer, frame):
+    """
+    Decode the standard YOLOv8 detect output:
+        [1, 84, 1344]
+    = 4 box coordinates + 80 class scores.
+
+    Returns detections as:
+        (raw_class_name, centroid, box_px, confidence)
+    """
+    result = compiled_model(
+        [preprocess_yolo_openvino(frame)]
+    )
+
+    output = np.asarray(
+        result[output_layer],
+        dtype=np.float32,
+    )
+
+    if output.ndim != 3 or output.shape[1] < 5:
+        raise RuntimeError(
+            f"Unexpected YOLO OpenVINO output shape: {output.shape}"
+        )
+
+    # [1, 84, 1344] -> [1344, 84]
+    predictions = output[0].T
+
+    # First 4 values are cx, cy, w, h. Remaining values are class scores.
+    boxes_cxcywh = predictions[:, :4]
+    class_scores = predictions[:, 4:]
+
+    class_ids = np.argmax(
+        class_scores,
+        axis=1,
+    )
+    confidences = class_scores[
+        np.arange(class_scores.shape[0]),
+        class_ids,
+    ]
+
+    keep = confidences >= YOLO_CONF_THRESHOLD
+
+    boxes_cxcywh = boxes_cxcywh[keep]
+    class_ids = class_ids[keep]
+    confidences = confidences[keep]
+
+    if len(boxes_cxcywh) == 0:
+        return []
+
+    h, w = frame.shape[:2]
+
+    sx = w / float(YOLO_INPUT_SIZE)
+    sy = h / float(YOLO_INPUT_SIZE)
+
+    boxes = []
+    score_list = []
+
+    for (cx, cy, bw, bh), conf in zip(
+        boxes_cxcywh,
+        confidences,
+    ):
+        x1 = int((cx - bw / 2.0) * sx)
+        y1 = int((cy - bh / 2.0) * sy)
+        x2 = int((cx + bw / 2.0) * sx)
+        y2 = int((cy + bh / 2.0) * sy)
+
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        x2 = max(0, min(w - 1, x2))
+        y2 = max(0, min(h - 1, y2))
+
+        bw_px = max(0, x2 - x1)
+        bh_px = max(0, y2 - y1)
+
+        boxes.append([x1, y1, bw_px, bh_px])
+        score_list.append(float(conf))
+
+    indices = cv2.dnn.NMSBoxes(
+        boxes,
+        score_list,
+        YOLO_CONF_THRESHOLD,
+        YOLO_NMS_IOU,
+    )
+
+    if indices is None or len(indices) == 0:
+        return []
+
+    indices = np.asarray(
+        indices,
+        dtype=np.int32,
+    ).reshape(-1)
+
+    detections = []
+
+    for idx in indices:
+        x, y, bw_px, bh_px = boxes[int(idx)]
+        x2 = x + bw_px
+        y2 = y + bh_px
+
+        cls_id = int(class_ids[int(idx)])
+        cls_name = (
+            COCO_NAMES[cls_id]
+            if 0 <= cls_id < len(COCO_NAMES)
+            else f"class_{cls_id}"
+        )
+
+        centroid = (
+            (x + x2) / 2.0,
+            (y + y2) / 2.0,
+        )
+
+        detections.append(
+            (
+                cls_name,
+                centroid,
+                (x, y, x2, y2),
+                float(score_list[int(idx)]),
+            )
+        )
+
+    return detections
+
 def load_midas_openvino():
     """Load the official MiDaS Small OpenVINO model on Intel GPU."""
     model_path = Path(MIDAS_MODEL_FILE)
@@ -536,7 +731,7 @@ class AsyncMidasWorker:
 
 
 def main():
-    model = YOLO(MODEL)
+    yolo_model, yolo_input, yolo_output = load_yolo_openvino()
     gru_model = load_gru_model()
     midas_model = load_midas_openvino()
     midas_worker = AsyncMidasWorker(midas_model)
@@ -586,33 +781,58 @@ def main():
 
         latest_midas_depth = midas_worker.get_latest()
 
-        results = model.predict(frame, verbose=False, imgsz=INFERENCE_IMGSZ)[0]
+        yolo_detections = infer_yolo_openvino(
+            yolo_model,
+            yolo_output,
+            frame,
+        )
         now = time.time()
 
         detections = []
-        all_boxes_for_display = []   # (cls_name_raw, box) -- includes unmapped classes
-        for box in results.boxes:
-            cls_name_raw = model.names[int(box.cls[0])]
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            box_px = (int(x1), int(y1), int(x2), int(y2))
-            all_boxes_for_display.append((cls_name_raw, box_px))
+        all_boxes_for_display = []
+
+        for cls_name_raw, centroid, box_px, confidence in yolo_detections:
+            all_boxes_for_display.append(
+                (cls_name_raw, box_px, confidence)
+            )
 
             mapped = CLASS_MAP.get(cls_name_raw)
             if mapped is None:
                 continue
-            area_frac = ((x2 - x1) * (y2 - y1)) / (w * h)
+
+            x1, y1, x2, y2 = box_px
+            area_frac = (
+                ((x2 - x1) * (y2 - y1))
+                / max(w * h, 1)
+            )
+
             raw_dist = bbox_area_to_distance(area_frac)
-            centroid = ((x1 + x2) / 2, (y1 + y2) / 2)
-            detections.append((mapped, centroid, box_px, raw_dist))
+
+            detections.append(
+                (mapped, centroid, box_px, raw_dist)
+            )
 
         tracks = match_detections_to_tracks(detections, tracks, w, now)
 
         # draw ALL raw YOLO detections dim (debug visibility), tracked ones on top
         if SHOW_ALL_DETECTIONS:
-            for cls_name_raw, box_px in all_boxes_for_display:
-                cv2.rectangle(frame, box_px[:2], box_px[2:], (80, 80, 80), 1)
-                cv2.putText(frame, cls_name_raw, (box_px[0], max(box_px[1] - 4, 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 80, 80), 1)
+            for cls_name_raw, box_px, confidence in all_boxes_for_display:
+                cv2.rectangle(
+                    frame,
+                    box_px[:2],
+                    box_px[2:],
+                    (80, 80, 80),
+                    1,
+                )
+                cv2.putText(
+                    frame,
+                    f"{cls_name_raw} {confidence:.2f}",
+                    (box_px[0], max(box_px[1] - 4, 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    (80, 80, 80),
+                    1,
+                )
 
         # draw all tracked objects (gray), highlight the selected one (red)
         selected = None
