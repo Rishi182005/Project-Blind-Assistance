@@ -81,7 +81,15 @@ YOLO_INPUT_SIZE = 256
 YOLO_CONF_THRESHOLD = 0.25
 YOLO_NMS_IOU = 0.45
 MAX_RANGE = 4.0
-CLASS_MAP = {
+# Keep YOLO's native semantic classes. Every YOLO class is allowed through
+# the navigation pipeline; only the GRU input is collapsed later to its legacy
+# six-class representation. This means chair stays "chair", laptop stays
+# "laptop", bottle stays "bottle", etc.
+CLASS_MAP = {}
+
+# The existing GRU was trained with six categorical values. Keep that mapping
+# isolated to the GRU boundary so it does not alter YOLO/tracking labels.
+GRU_CLASS_MAP = {
     "person": "person",
     "car": "vehicle", "truck": "vehicle", "bus": "vehicle",
     "traffic light": "pole", "fire hydrant": "pole", "stop sign": "pole",
@@ -92,10 +100,8 @@ CLASS_MAP = {
     "bottle": "pole",
     "tv": "wall",
 }
-# Note: bucket, TV stand, air conditioner, table mat etc. aren't COCO
-# classes at all -- YOLOv8n was trained on 80 fixed categories and none
-# of these exist in it, so no CLASS_MAP entry can make them detectable.
-# Only a custom-trained model would add them.
+# Note: classes outside COCO still cannot be detected by this pretrained model,
+# but every COCO class it does detect is now retained with its native label.
 
 INFERENCE_IMGSZ = 256             # resolution YOLO actually runs inference at --
                                    # lower = faster, less accurate on small objects.
@@ -108,6 +114,9 @@ SHOW_ALL_DETECTIONS = False        # set True to also draw every raw YOLO detect
                                    # (any class, dim gray) for debugging -- off by
                                    # default so the view only shows the nearest
                                    # MAX_TRACKS tracked objects
+# Keep YOLO's semantic class names intact throughout detection/tracking/display.
+# The legacy 6-class representation is used ONLY when constructing the GRU's
+# existing 4-feature input, so the trained GRU schema remains compatible.
 FEATURE_CLASSES = ["none", "person", "pole", "wall", "vehicle", "curb"]
 AGENT_SPEED_ASSUMED = 1.2
 
@@ -136,7 +145,7 @@ GRU_INFERENCE_EVERY_N_FRAMES = 3
 MIDAS_MODEL_FILE = "MiDaS/weights/openvino/openvino_midas_v21_small_256.xml"
 MIDAS_DEVICE = "GPU"
 MIDAS_INPUT_SIZE = 256
-MIDAS_INFERENCE_EVERY_N_FRAMES = 1
+MIDAS_INFERENCE_EVERY_N_FRAMES = 1       # Async; main loop never waits for it.
 
 # ---- immediate proximity safety layer ----
 # These are deliberately NOT fed back into the GRU. The GRU remains the
@@ -344,86 +353,70 @@ def resize_fixed(frame, width):
 
 
 def _depth_core_and_surrounding(raw_depth, box, frame_shape):
-    """Return robust MiDaS depth statistics for an object and its surroundings.
+    """Compute object/surrounding depth directly on the MiDaS grid.
 
-    The comparison is intentionally relative within the same frame. This is
-    useful because MiDaS is a relative/inverse-depth model and its absolute
-    scale can drift between frames.
+    This avoids resizing the raw 256x256 depth map to the full camera frame for
+    every tracked object.
     """
     if (
         raw_depth is None
         or not isinstance(raw_depth, np.ndarray)
         or raw_depth.size == 0
+        or raw_depth.ndim != 2
     ):
         return float("nan"), float("nan")
 
-    h, w = frame_shape[:2]
-
-    depth = cv2.resize(
-        raw_depth,
-        (w, h),
-        interpolation=cv2.INTER_LINEAR,
-    ).astype(np.float32)
+    fh, fw = frame_shape[:2]
+    dh, dw = raw_depth.shape[:2]
+    sx = dw / max(float(fw), 1.0)
+    sy = dh / max(float(fh), 1.0)
 
     x1, y1, x2, y2 = map(int, box)
+    x1 = max(0, min(fw - 2, x1))
+    y1 = max(0, min(fh - 2, y1))
+    x2 = max(x1 + 2, min(fw, x2))
+    y2 = max(y1 + 2, min(fh, y2))
 
-    x1 = max(0, min(w - 2, x1))
-    y1 = max(0, min(h - 2, y1))
-    x2 = max(x1 + 2, min(w, x2))
-    y2 = max(y1 + 2, min(h, y2))
+    dx1 = max(0, min(dw - 2, int(round(x1 * sx))))
+    dy1 = max(0, min(dh - 2, int(round(y1 * sy))))
+    dx2 = max(dx1 + 2, min(dw, int(round(x2 * sx))))
+    dy2 = max(dy1 + 2, min(dh, int(round(y2 * sy))))
 
-    bw = x2 - x1
-    bh = y2 - y1
+    bw = dx2 - dx1
+    bh = dy2 - dy1
 
-    # Inner object core: reduce contamination from the bbox boundary.
-    ix1 = x1 + int(0.20 * bw)
-    ix2 = x2 - int(0.20 * bw)
-    iy1 = y1 + int(0.20 * bh)
-    iy2 = y2 - int(0.20 * bh)
-
+    ix1 = dx1 + int(0.20 * bw)
+    ix2 = dx2 - int(0.20 * bw)
+    iy1 = dy1 + int(0.20 * bh)
+    iy2 = dy2 - int(0.20 * bh)
     if ix2 <= ix1 or iy2 <= iy1:
-        ix1, iy1, ix2, iy2 = x1, y1, x2, y2
+        ix1, iy1, ix2, iy2 = dx1, dy1, dx2, dy2
 
+    depth = raw_depth.astype(np.float32, copy=False)
     core = depth[iy1:iy2, ix1:ix2]
     core_vals = core[np.isfinite(core)]
 
-    # Surrounding ring: expand bbox, then exclude the original bbox.
-    pad_x = max(8, int(0.55 * bw))
-    pad_y = max(8, int(0.55 * bh))
+    pad_x = max(3, int(0.55 * bw))
+    pad_y = max(3, int(0.55 * bh))
+    ox1 = max(0, dx1 - pad_x)
+    oy1 = max(0, dy1 - pad_y)
+    ox2 = min(dw, dx2 + pad_x)
+    oy2 = min(dh, dy2 + pad_y)
 
-    ox1 = max(0, x1 - pad_x)
-    oy1 = max(0, y1 - pad_y)
-    ox2 = min(w, x2 + pad_x)
-    oy2 = min(h, y2 + pad_y)
+    outer = depth[oy1:oy2, ox1:ox2]
+    inner_x1 = dx1 - ox1
+    inner_y1 = dy1 - oy1
+    inner_x2 = dx2 - ox1
+    inner_y2 = dy2 - oy1
 
-    outer = depth[oy1:oy2, ox1:ox2].copy()
-
-    inner_x1 = x1 - ox1
-    inner_y1 = y1 - oy1
-    inner_x2 = x2 - ox1
-    inner_y2 = y2 - oy1
-
-    ring_mask = np.ones(
-        outer.shape,
-        dtype=bool,
-    )
-    ring_mask[
-        inner_y1:inner_y2,
-        inner_x1:inner_x2,
-    ] = False
-
-    surround_vals = outer[
-        ring_mask & np.isfinite(outer)
-    ]
+    ring_mask = np.ones(outer.shape, dtype=bool)
+    ring_mask[inner_y1:inner_y2, inner_x1:inner_x2] = False
+    surround_vals = outer[ring_mask & np.isfinite(outer)]
 
     if core_vals.size < 8 or surround_vals.size < 20:
         return float("nan"), float("nan")
 
-    return (
-        float(np.median(core_vals)),
-        float(np.median(surround_vals)),
-    )
-
+    return float(np.median(core_vals)), float(np.median(surround_vals))
 
 def midas_relative_correction(raw_depth, box, frame_shape):
     """Convert MiDaS relative depth contrast into a bounded distance correction.
@@ -1236,259 +1229,168 @@ def grow_depth_region(depth, seed_box, seed_depth, frame_shape):
     return (x, y, bw, bh), float((bw * bh) / max(float(frame_shape[0] * frame_shape[1]), 1.0))
 
 def analyze_depth(depth_norm, frame_shape):
-    """
-    V4: detect objects as local depth protrusions, not simply "near" pixels.
+    """Fast MiDaS protrusion detector operating at MiDaS native resolution.
 
-    Key idea:
-      * A floor usually changes depth smoothly across the image.
-      * A nearby object creates a local depth residual relative to its
-        surrounding smooth surface.
-      * We combine local residual, gradient/edge support, component geometry,
-        and a modest near-depth requirement.
-
-    This is still a diagnostic detector; no YOLO/GRU decision is made here.
+    The previous version resized the 256x256 MiDaS map to the full camera
+    resolution before every blur/Sobel/morphology operation. That made the
+    detector much more expensive than necessary. We now do all numerical
+    processing in the native MiDaS grid and upscale only the final mask once.
+    Candidate boxes are converted back to native camera coordinates before
+    returning, so downstream tracking/fusion logic remains unchanged.
     """
+    if (not isinstance(depth_norm, np.ndarray)
+            or depth_norm.size == 0
+            or depth_norm.ndim != 2):
+        h, w = frame_shape[:2]
+        return np.zeros((h, w), dtype=np.uint8), [], 0.0, {}
+
     h, w = frame_shape[:2]
+    depth = depth_norm.astype(np.float32, copy=False)
+    dh, dw = depth.shape[:2]
 
-    depth = cv2.resize(
-        depth_norm,
-        (w, h),
-        interpolation=cv2.INTER_LINEAR,
-    ).astype(np.float32)
-
-    # Forward/ground region.
-    y0 = int(h * 0.32)
-    y1 = int(h * 0.94)
-
+    # Forward/ground region, evaluated on the native 256x256 grid.
+    y0 = int(dh * 0.32)
+    y1 = int(dh * 0.94)
+    y1 = max(y0 + 1, min(dh, y1))
     roi = depth[y0:y1, :]
 
     if roi.size == 0:
-        return (
-            np.zeros((h, w), dtype=np.uint8),
-            [],
-            0.0,
-            {},
-        )
+        return np.zeros((h, w), dtype=np.uint8), [], 0.0, {}
 
-    # Smooth surface model. Large-scale floor/background gradients remain
-    # in the blur, while local protrusions survive in the residual.
+    # Scale the old full-frame blur sizes down to MiDaS native resolution.
+    scale = min(dw / 640.0, dh / 480.0)
+    sigma_large = max(3.0, 18.0 * scale)
+    sigma_small = max(1.0, 4.0 * scale)
+
     smooth = cv2.GaussianBlur(
-        roi,
-        (0, 0),
-        sigmaX=18.0,
-        sigmaY=18.0,
+        roi, (0, 0), sigmaX=sigma_large, sigmaY=sigma_large
     )
-
     residual = roi - smooth
 
-    # A second, smaller blur emphasizes coherent local protrusions rather than
-    # one-pixel noise.
     residual_smooth = cv2.GaussianBlur(
-        residual,
-        (0, 0),
-        sigmaX=4.0,
-        sigmaY=4.0,
+        residual, (0, 0), sigmaX=sigma_small, sigmaY=sigma_small
     )
 
-    # Depth gradient gives supporting evidence for object boundaries.
-    gx = cv2.Sobel(
-        roi,
-        cv2.CV_32F,
-        1,
-        0,
-        ksize=3,
-    )
-    gy = cv2.Sobel(
-        roi,
-        cv2.CV_32F,
-        0,
-        1,
-        ksize=3,
-    )
+    gx = cv2.Sobel(roi, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3)
     gradient = cv2.magnitude(gx, gy)
 
-    # Normalize gradient robustly.
-    grad_scale = float(
-        np.percentile(
-            gradient,
-            90
-        )
-    )
+    grad_scale = float(np.percentile(gradient, 90))
     if grad_scale > 1e-6:
-        gradient_n = np.clip(
-            gradient / grad_scale,
-            0.0,
-            1.0,
-        )
+        gradient_n = np.clip(gradient / grad_scale, 0.0, 1.0)
     else:
         gradient_n = np.zeros_like(gradient)
 
-    # Current-frame near threshold is used only as supporting evidence.
-    near_threshold = float(
-        np.percentile(
-            roi,
-            70.0,
-        )
-    )
+    near_threshold = float(np.percentile(roi, 70.0))
     near = roi >= near_threshold
 
-    # Robust residual threshold.
     abs_residual = np.abs(residual_smooth)
-
-    residual_med = float(
-        np.median(abs_residual)
-    )
+    residual_med = float(np.median(abs_residual))
     residual_mad = float(
-        np.median(
-            np.abs(
-                abs_residual
-                - residual_med
-            )
-        )
+        np.median(np.abs(abs_residual - residual_med))
     )
-
     residual_threshold = max(
         0.055,
-        residual_med
-        + 3.0 * residual_mad,
+        residual_med + 3.0 * residual_mad,
     )
 
-    # Higher depth = closer in our normalized representation, so keep only
-    # positive residuals: locally nearer than the surrounding smooth surface.
     protrusion = (
         (residual_smooth >= residual_threshold)
         & near
         & (gradient_n >= 0.08)
     ).astype(np.uint8) * 255
 
-    # Light morphology connects object interiors but avoids giant floor blobs.
-    kernel = np.ones(
-        (3, 3),
-        np.uint8,
-    )
-
+    # Keep morphology intentionally light at native resolution.
+    kernel = np.ones((3, 3), np.uint8)
     protrusion = cv2.morphologyEx(
-        protrusion,
-        cv2.MORPH_OPEN,
-        kernel,
+        protrusion, cv2.MORPH_OPEN, kernel
     )
-
     protrusion = cv2.morphologyEx(
-        protrusion,
-        cv2.MORPH_CLOSE,
-        kernel,
+        protrusion, cv2.MORPH_CLOSE, kernel
     )
 
-    # V11: connect broken edge fragments belonging to the same physical
-    # object.  This acts on the residual mask, not raw depth, so smooth floors
-    # are not turned into obstacles merely by this operation.
-    bridge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    # Connect small broken edge pieces, but don't bridge large regions.
+    bridge_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (5, 5)
+    )
     protrusion = cv2.morphologyEx(
         protrusion,
         cv2.MORPH_CLOSE,
         bridge_kernel,
-        iterations=2,
+        iterations=1,
     )
 
-    full_mask = np.zeros(
-        (h, w),
-        dtype=np.uint8,
+    # One upscale operation for display/mask persistence. Numerical processing
+    # above remains entirely on the cheap native MiDaS grid.
+    full_mask = cv2.resize(
+        protrusion,
+        (w, h),
+        interpolation=cv2.INTER_NEAREST,
     )
 
-    full_mask[y0:y1, :] = protrusion
-
-    # Connected residual regions.
-    n_labels, labels, stats, _ = (
-        cv2.connectedComponentsWithStats(
-            protrusion,
-            connectivity=8,
-        )
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        protrusion, connectivity=8
     )
 
     candidates = []
 
+    # Scale minimum area from the old 640x480 processing grid to native grid.
+    reference_area = 640.0 * 480.0
+    native_area = float(dw * dh)
+    min_area_native = max(
+        25,
+        int(round(250.0 * native_area / reference_area)),
+    )
+    min_height_native = max(6, int(round(dh * 0.035)))
+    min_width_native = max(5, int(round(dw * 0.03)))
+
+    sx = w / float(dw)
+    sy = h / float(dh)
+
     for label in range(1, n_labels):
-        area = int(
-            stats[label, cv2.CC_STAT_AREA]
-        )
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        bw_native = int(stats[label, cv2.CC_STAT_WIDTH])
+        bh_native = int(stats[label, cv2.CC_STAT_HEIGHT])
+        x_native = int(stats[label, cv2.CC_STAT_LEFT])
+        y_native = int(stats[label, cv2.CC_STAT_TOP])
 
-        bw = int(
-            stats[label, cv2.CC_STAT_WIDTH]
-        )
-
-        bh = int(
-            stats[label, cv2.CC_STAT_HEIGHT]
-        )
-
-        x = int(
-            stats[label, cv2.CC_STAT_LEFT]
-        )
-
-        y = int(
-            stats[label, cv2.CC_STAT_TOP]
-        )
-
-        if area < 250:
+        if area < min_area_native:
+            continue
+        if bh_native < min_height_native:
+            continue
+        if bw_native < min_width_native:
             continue
 
-        if bh < int(h * 0.035):
-            continue
-
-        if bw < int(w * 0.03):
-            continue
-
-        fill = area / max(
-            float(bw * bh),
-            1.0,
-        )
-
+        fill = area / max(float(bw_native * bh_native), 1.0)
         if fill < 0.10:
             continue
 
         component = labels == label
-
-        component_residual = residual_smooth[
-            component
-        ]
-
-        component_gradient = gradient_n[
-            component
-        ]
-
-        component_depth = roi[
-            component
-        ]
+        component_residual = residual_smooth[component]
+        component_gradient = gradient_n[component]
+        component_depth = roi[component]
 
         if component_residual.size == 0:
             continue
 
-        contrast = float(
-            np.median(component_residual)
-        )
+        contrast = float(np.median(component_residual))
+        edge_support = float(np.mean(component_gradient))
+        depth_level = float(np.median(component_depth))
 
-        edge_support = float(
-            np.mean(component_gradient)
-        )
-
-        depth_level = float(
-            np.median(component_depth)
-        )
-
-        # Require the candidate to actually protrude from a smooth surface.
         if contrast < residual_threshold:
             continue
 
-        # Ignore very flat strips, which are often table/floor boundaries.
-        aspect = bh / max(
-            float(bw),
-            1.0,
-        )
-
-        if aspect < 0.12 and bw > int(w * 0.20):
+        aspect = bh_native / max(float(bw_native), 1.0)
+        if aspect < 0.12 and bw_native > int(dw * 0.20):
             continue
 
-        cx = x + bw / 2.0
+        # Convert native ROI/component coordinates back to full-frame pixels.
+        x = int(round(x_native * sx))
+        y = int(round((y_native + y0) * sy))
+        bw = max(1, int(round(bw_native * sx)))
+        bh = max(1, int(round(bh_native * sy)))
 
+        cx = x + bw / 2.0
         if cx < w * 0.34:
             zone = "LEFT"
         elif cx < w * 0.66:
@@ -1496,15 +1398,9 @@ def analyze_depth(depth_norm, frame_shape):
         else:
             zone = "RIGHT"
 
-        # V14: the connected protrusion component is the navigation geometry.
-        # Do not expand it using a depth plateau. The black/white mask is the
-        # most reliable boundary signal we currently have from MiDaS.
-        final_box = (x, y + y0, bw, bh)
+        final_box = (x, y, bw, bh)
         grown_area_frac = (bw * bh) / max(float(w * h), 1.0)
 
-        # Candidate quality score. This is the same scoring rule used by the
-        # proven standalone MiDaS detector. V17 previously referenced `score`
-        # before defining it, which caused every MiDaS candidate pass to fail.
         score = (
             min(contrast / 0.16, 1.0) * 0.50
             + min(edge_support / 0.50, 1.0) * 0.20
@@ -1512,10 +1408,6 @@ def analyze_depth(depth_norm, frame_shape):
             + depth_level * 0.15
         )
 
-        # Reject tiny navigation boxes. The protrusion mask can contain a
-        # mathematically valid but physically meaningless speck; those should
-        # never become a tracked obstacle. Keep this conservative because YOLO
-        # remains responsible for known classes and MiDaS is the fallback.
         fx, fy, fw, fh = final_box
         if fw < int(w * 0.030) or fh < int(h * 0.040):
             continue
@@ -1523,41 +1415,28 @@ def analyze_depth(depth_norm, frame_shape):
         candidates.append({
             "zone": zone,
             "box": final_box,
-            "seed_box": (x, y + y0, bw, bh),
+            "seed_box": final_box,
             "area": area,
             "grown_area_frac": grown_area_frac,
             "component_fill": fill,
             "depth_contrast": contrast,
             "edge_support": edge_support,
             "depth_level": depth_level,
-            "score": score,
+            "score": float(score),
         })
 
-    candidates.sort(
-        key=lambda c: c["score"],
-        reverse=True,
-    )
+    candidates.sort(key=lambda c: c["score"], reverse=True)
 
     zone_stats = {
         "threshold": residual_threshold,
-        "mean_abs_residual": float(
-            np.mean(abs_residual)
-        ),
-        "max_positive_residual": float(
-            np.max(residual_smooth)
-        ),
-        "near_fraction": float(
-            np.mean(near)
-        ),
+        "mean_abs_residual": float(np.mean(abs_residual)),
+        "max_positive_residual": float(np.max(residual_smooth)),
+        "near_fraction": float(np.mean(near)),
         "candidates": len(candidates),
+        "processing_grid": f"{dw}x{dh}",
     }
 
-    return (
-        full_mask,
-        candidates,
-        residual_threshold,
-        zone_stats,
-    )
+    return full_mask, candidates, residual_threshold, zone_stats
 
 # ---- TEMPORAL STABILITY ----
 
@@ -1684,25 +1563,44 @@ def stabilize_candidates(candidates, state):
     return stable
 
 def raw_midas_depth_for_box(raw_depth, box, frame_shape):
-    """Robust raw MiDaS depth statistic inside a native-frame bbox."""
-    if raw_depth is None or not isinstance(raw_depth, np.ndarray) or raw_depth.size == 0:
+    """Robust raw MiDaS depth statistic without full-frame upscaling."""
+    if (
+        raw_depth is None
+        or not isinstance(raw_depth, np.ndarray)
+        or raw_depth.size == 0
+        or raw_depth.ndim != 2
+    ):
         return float("nan")
+
     h, w = frame_shape[:2]
-    depth_full = cv2.resize(raw_depth, (w, h), interpolation=cv2.INTER_LINEAR)
+    dh, dw = raw_depth.shape[:2]
+    sx = dw / max(float(w), 1.0)
+    sy = dh / max(float(h), 1.0)
+
     x, y, bw, bh = [int(v) for v in box]
-    x0 = max(0, min(w - 1, x)); y0 = max(0, min(h - 1, y))
-    x1 = max(x0 + 1, min(w, x + bw)); y1 = max(y0 + 1, min(h, y + bh))
-    patch = depth_full[y0:y1, x0:x1].astype(np.float32)
+    x0 = max(0, min(w - 1, x))
+    y0 = max(0, min(h - 1, y))
+    x1 = max(x0 + 1, min(w, x + bw))
+    y1 = max(y0 + 1, min(h, y + bh))
+
+    dx0 = max(0, min(dw - 1, int(round(x0 * sx))))
+    dy0 = max(0, min(dh - 1, int(round(y0 * sy))))
+    dx1 = max(dx0 + 1, min(dw, int(round(x1 * sx))))
+    dy1 = max(dy0 + 1, min(dh, int(round(y1 * sy))))
+
+    patch = raw_depth[dy0:dy1, dx0:dx1].astype(np.float32, copy=False)
     if patch.size == 0:
         return float("nan")
-    py0, py1 = int(patch.shape[0]*0.15), max(int(patch.shape[0]*0.85), 1)
-    px0, px1 = int(patch.shape[1]*0.15), max(int(patch.shape[1]*0.85), 1)
+
+    py0 = int(patch.shape[0] * 0.15)
+    py1 = max(py0 + 1, int(patch.shape[0] * 0.85))
+    px0 = int(patch.shape[1] * 0.15)
+    px1 = max(px0 + 1, int(patch.shape[1] * 0.85))
     core = patch[py0:py1, px0:px1]
     vals = core[np.isfinite(core)]
     if vals.size < 8:
         vals = patch[np.isfinite(patch)]
     return float(np.median(vals)) if vals.size else float("nan")
-
 
 def update_unknown_tracks(raw_candidates, stable_candidates, unknown_tracks, now, frame_area, raw_midas_depth, frame_shape, midas_calibrator):
     """Maintain one metric-distance/TTC track per MiDaS navigation zone.
@@ -1995,7 +1893,9 @@ def main():
     print("Temporal stability: 3/5 frames")
     print("Unknown obstacle: unified distance/TTC/GRU path + safety floor.")
     print("Depth/BW panel: persistent after first valid MiDaS result.")
-    print("MiDaS bbox: protrusion-mask geometry only + balanced fragment merge.")
+    print("MiDaS bbox: native-grid protrusion geometry + balanced fragment merge.")
+    print("YOLO labels: full semantic classes preserved; 6-class mapping only at GRU input.")
+    print("MiDaS processing: native-grid analysis; full-resolution upscale only for display.")
     print("Press 'q' to quit.")
 
     try:
@@ -2147,11 +2047,9 @@ def main():
                 )
 
                 mapped = CLASS_MAP.get(
-                    cls_name_raw
+                    cls_name_raw,
+                    cls_name_raw,
                 )
-
-                if mapped is None:
-                    continue
 
                 x1, y1, x2, y2 = box_px
 
@@ -2259,7 +2157,7 @@ def main():
                 fused_detections = []
                 used_midas = set()
 
-                for mapped, centroid, box_px, raw_dist in detections:
+                for raw_cls_name, centroid, box_px, raw_dist in detections:
                     best = None
                     best_score = -1.0
 
@@ -2304,7 +2202,7 @@ def main():
                         )
 
                     fused_detections.append(
-                        (mapped, centroid, box_px, raw_dist)
+                        (raw_cls_name, centroid, box_px, raw_dist)
                     )
 
                 detections = fused_detections
@@ -2570,8 +2468,15 @@ def main():
             # ---------------------------------------------------------
             # Existing GRU / proximity path — unchanged
             # ---------------------------------------------------------
-            cls_idx = FEATURE_CLASSES.index(
+            # Preserve the real YOLO semantic label everywhere; only collapse
+            # it at the boundary to the legacy GRU's six-class feature.
+            gru_cls_name = (
                 cls_name
+                if cls_name == "curb"
+                else GRU_CLASS_MAP.get(cls_name, "none")
+            )
+            cls_idx = FEATURE_CLASSES.index(
+                gru_cls_name
             )
 
             feature_vec = [
@@ -2724,7 +2629,7 @@ def main():
                     (0, 90, 255), 0.50, 2,
                 ),
                 (
-                    f"GRU input: d={dist:.2f} m  close={closing_speed:+.2f}  class={cls_name}",
+                    f"GRU input: d={dist:.2f} m  close={closing_speed:+.2f}  YOLO={cls_name}  GRU-class={gru_cls_name}",
                     (235, 235, 235), 0.46, 1,
                 ),
                 (
@@ -2736,7 +2641,7 @@ def main():
                     (235, 235, 235), 0.46, 1,
                 ),
                 (
-                    f"FPS: {fps:.1f} | Distance mode: {'TRACK-REF' if selected is not None and getattr(selected, 'reference_locked', False) else 'CALIBRATING'}",
+                    f"FPS: {fps:.1f} | MiDaS grid: native 256x256 | async",
                     (235, 235, 235), 0.46, 1,
                 ),
             ]
@@ -2791,7 +2696,7 @@ def main():
                 (metric_status, (0, 255, 255), 0.46, 1),
                 (yolo_anchor_text, (255, 255, 0), 0.46, 1),
                 (f"MiDaS correction factor: {midas_corr:.2f}", (255, 255, 0), 0.46, 1),
-                ("Depth values are used as relative correction evidence.", (235, 235, 235), 0.44, 1),
+                ("Depth values provide relative correction evidence only.", (235, 235, 235), 0.44, 1),
                 ("Final bbox geometry: fused physical obstacles only.", (235, 235, 235), 0.44, 1),
             ]
 
