@@ -14,9 +14,10 @@ can be more urgent than a slow/stationary object that's physically closer
 (e.g. a pole 2m away). Picking by raw nearest-distance misses this --
 picking by TTC catches it.
 
-Still 100% software -- no new hardware required. Distance is still the
-same bbox-size heuristic as before (DIST_C / DIST_EXPONENT, fitted via
-calibrate_distance.py), swap for real HC-SR04 readings later.
+Still 100% software -- no new hardware required. YOLO distance uses the
+existing calibrated bbox-size heuristic. MiDaS-only distance uses raw MiDaS
+inverse-depth with a separate online metric calibration learned from matched
+YOLO+MiDaS objects.
 
 pip install ultralytics opencv-python --break-system-packages
 """
@@ -162,24 +163,73 @@ BOTTOM_ZONE_CRITICAL_FRAC = 0.95
 # The protrusion mask often contains only the strongest depth edges of a
 # real object. Grow each confirmed seed into the surrounding depth plateau
 # so the displayed bbox covers the object rather than a tiny edge fragment.
-DEPTH_GROW_RADIUS_FRAC = 0.12
-DEPTH_GROW_TOLERANCE = 0.105
-DEPTH_GROW_MIN_COMPONENT_FRAC = 0.0008
-DEPTH_GROW_MAX_COMPONENT_FRAC = 0.42
-BOX_SMOOTH_ALPHA = 0.30
+# V14: MiDaS bbox geometry comes from the protrusion mask itself.
+# Do NOT grow a seed through a depth plateau: that was causing large
+# background/laptop/floor regions to become giant false boxes.
+DEPTH_GROW_RADIUS_FRAC = 0.0
+DEPTH_GROW_TOLERANCE = 0.0
+DEPTH_GROW_MIN_COMPONENT_FRAC = 0.0
+DEPTH_GROW_MAX_COMPONENT_FRAC = 0.08
+BOX_SMOOTH_ALPHA = 0.22
+
+# Retained for Track geometry bookkeeping. The V18 fusion pipeline no longer
+# uses the old first-bbox reference-distance mechanism, but Track.update()
+# still uses these guards for safe area calculations.
+TRACK_REFERENCE_MIN_AREA_FRAC = 1e-4
+TRACK_REFERENCE_MAX_AREA_FRAC = 0.50
+TRACK_AREA_EMA_ALPHA = 0.20
+# Fragment merging is intentionally conservative. Only edge fragments that
+# are close in image space and overlap strongly in one axis may be combined.
+MIDAS_MERGE_GAP_FRAC_V14 = 0.018
+MIDAS_MERGE_MIN_OVERLAP_V14 = 0.30
+MIDAS_MERGE_CENTER_FRAC_V14 = 0.07
+
 
 
 EMA_ALPHA = 0.12
 CLOSING_SPEED_EMA_ALPHA = 0.14
 RISK_EMA_ALPHA = 0.16
 SPEED_WINDOW = 8                 # frames of history kept per tracked object
+
+# ---- distance fusion ----
+# Keep the original calibrated YOLO bbox-area model as the metric anchor.
+# MiDaS is used as a RELATIVE correction signal, not as a second absolute
+# metre measurement. This avoids treating raw MiDaS values as metres.
+#
+# Frame-level fusion:
+#     d_yolo = existing calibrated YOLO distance
+#     r      = median(MiDaS depth inside object) /
+#              median(MiDaS depth around object)
+#     d_fused = d_yolo * correction(r)
+#
+# The fused value is then aggregated over a short temporal window before
+# closing speed/TTC are calculated.
+DIST_FUSION_ENABLED = True
+MIDAS_CORRECTION_GAMMA = 0.65
+MIDAS_CORRECTION_MIN = 0.70
+MIDAS_CORRECTION_MAX = 1.30
+MIDAS_RATIO_MIN = 0.70
+MIDAS_RATIO_MAX = 1.60
+DIST_FUSION_MEDIAN_WINDOW = 5
+TRACK_DISTANCE_EMA_ALPHA = 0.22
+
+# The old per-track reference-distance mechanism is disabled because a wrong
+# first bbox can permanently anchor a track to the wrong absolute distance.
+TRACK_REFERENCE_LOCK = False
+
 SPEED_DEADBAND = 0.05
-DIST_C = 0.3364                  # from calibrate_distance.py power-law fit --
-                                  # RE-CALIBRATE if camera/mount/resolution changes
-DIST_EXPONENT = 0.7769           # fitted exponent -- do NOT assume 0.5 (naive
-                                  # geometric model); lens distortion and YOLO box
-                                  # behavior at close range pull this away from 0.5
-                                  # in practice, confirmed by calibration data
+DIST_C = 0.4327                  # recalibrated from 12 fresh person-distance points (0.25m..3.00m)
+DIST_EXPONENT = 0.7530
+
+# Retained for MiDaS-only fallback objects. These values are NOT used for
+# YOLO+MiDaS fused objects.
+MIDAS_CALIBRATION_MIN_SAMPLES = 6
+MIDAS_CALIBRATION_MAX_SAMPLES = 120
+MIDAS_CALIBRATION_MIN_RAW_SPREAD = 1e-4
+MIDAS_DISTANCE_MIN = 0.20
+MIDAS_DISTANCE_MAX = MAX_RANGE
+MIDAS_DISTANCE_FALLBACK = 4.0
+MIDAS_DISTANCE_EMA_ALPHA = 0.18
 
 ROTATE = False                   # keep native landscape orientation
 PROCESS_WIDTH = None             # keep native resolution -- set to an int to force resize
@@ -202,11 +252,11 @@ UNKNOWN_REPLACEMENT_MARGIN_M = 0.15           # TTC assigned when an object isn'
 
 # V11: geometry/fusion guards.  MiDaS mask fragments are treated as one
 # physical obstacle when they are spatially close and have similar depth.
-MIDAS_MERGE_GAP_FRAC = 0.055
-MIDAS_MERGE_MIN_OVERLAP = 0.12
-MIDAS_MERGE_CENTER_FRAC = 0.16
-YOLO_MIDAS_CENTER_FRAC = 0.14
-YOLO_MIDAS_MIN_CONTAINMENT = 0.12
+MIDAS_MERGE_GAP_FRAC = 0.035
+MIDAS_MERGE_MIN_OVERLAP = 0.20
+MIDAS_MERGE_CENTER_FRAC = 0.11
+YOLO_MIDAS_CENTER_FRAC = 0.10
+YOLO_MIDAS_MIN_CONTAINMENT = 0.18
 
                                   # in (moving away or stationary) -- effectively
                                   # "infinite time," so it never wins the
@@ -219,6 +269,70 @@ def bbox_area_to_distance(box_area_frac):
     return float(np.clip(est, 0.2, MAX_RANGE))
 
 
+class MidasMetricCalibrator:
+    """Learn raw MiDaS inverse-depth -> metric distance from YOLO matches."""
+    def __init__(self):
+        self.samples = deque(maxlen=MIDAS_CALIBRATION_MAX_SAMPLES)
+        self.a = None
+        self.b = None
+        self.last_prediction = None
+
+    def add(self, raw_depth, metric_distance):
+        raw_depth = float(raw_depth)
+        metric_distance = float(metric_distance)
+        if not np.isfinite(raw_depth) or not np.isfinite(metric_distance):
+            return
+        if metric_distance < MIDAS_DISTANCE_MIN or metric_distance > MIDAS_DISTANCE_MAX:
+            return
+        self.samples.append((raw_depth, metric_distance))
+        self._fit()
+
+    def _fit(self):
+        if len(self.samples) < MIDAS_CALIBRATION_MIN_SAMPLES:
+            return
+        x = np.asarray([p[0] for p in self.samples], dtype=np.float64)
+        y = np.asarray([1.0 / p[1] for p in self.samples], dtype=np.float64)
+        if not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
+            return
+        if float(np.ptp(x)) < MIDAS_CALIBRATION_MIN_RAW_SPREAD:
+            return
+        try:
+            a, b = np.polyfit(x, y, 1)
+            pred = a * x + b
+            resid = np.abs(pred - y)
+            med = float(np.median(resid))
+            mad = float(np.median(np.abs(resid - med)))
+            keep = resid <= max(3.0 * mad, 0.015)
+            if int(np.count_nonzero(keep)) >= MIDAS_CALIBRATION_MIN_SAMPLES:
+                a, b = np.polyfit(x[keep], y[keep], 1)
+            if np.isfinite(a) and np.isfinite(b) and a > 0:
+                self.a = float(a)
+                self.b = float(b)
+        except Exception:
+            pass
+
+    def predict(self, raw_depth):
+        raw_depth = float(raw_depth)
+        if self.a is None or self.b is None or not np.isfinite(raw_depth):
+            return MIDAS_DISTANCE_FALLBACK, False
+        inv_d = self.a * raw_depth + self.b
+        if not np.isfinite(inv_d) or inv_d <= 1e-6:
+            return MIDAS_DISTANCE_FALLBACK, False
+        dist = float(np.clip(1.0 / inv_d, MIDAS_DISTANCE_MIN, MIDAS_DISTANCE_MAX))
+        if self.last_prediction is None:
+            self.last_prediction = dist
+        else:
+            self.last_prediction = (
+                MIDAS_DISTANCE_EMA_ALPHA * dist
+                + (1.0 - MIDAS_DISTANCE_EMA_ALPHA) * self.last_prediction
+            )
+        return float(self.last_prediction), True
+
+    @property
+    def ready(self):
+        return self.a is not None and self.b is not None
+
+
 def resize_fixed(frame, width):
     if width is None:
         return frame
@@ -229,28 +343,287 @@ def resize_fixed(frame, width):
     return cv2.resize(frame, (width, int(h * scale)))
 
 
+def _depth_core_and_surrounding(raw_depth, box, frame_shape):
+    """Return robust MiDaS depth statistics for an object and its surroundings.
+
+    The comparison is intentionally relative within the same frame. This is
+    useful because MiDaS is a relative/inverse-depth model and its absolute
+    scale can drift between frames.
+    """
+    if (
+        raw_depth is None
+        or not isinstance(raw_depth, np.ndarray)
+        or raw_depth.size == 0
+    ):
+        return float("nan"), float("nan")
+
+    h, w = frame_shape[:2]
+
+    depth = cv2.resize(
+        raw_depth,
+        (w, h),
+        interpolation=cv2.INTER_LINEAR,
+    ).astype(np.float32)
+
+    x1, y1, x2, y2 = map(int, box)
+
+    x1 = max(0, min(w - 2, x1))
+    y1 = max(0, min(h - 2, y1))
+    x2 = max(x1 + 2, min(w, x2))
+    y2 = max(y1 + 2, min(h, y2))
+
+    bw = x2 - x1
+    bh = y2 - y1
+
+    # Inner object core: reduce contamination from the bbox boundary.
+    ix1 = x1 + int(0.20 * bw)
+    ix2 = x2 - int(0.20 * bw)
+    iy1 = y1 + int(0.20 * bh)
+    iy2 = y2 - int(0.20 * bh)
+
+    if ix2 <= ix1 or iy2 <= iy1:
+        ix1, iy1, ix2, iy2 = x1, y1, x2, y2
+
+    core = depth[iy1:iy2, ix1:ix2]
+    core_vals = core[np.isfinite(core)]
+
+    # Surrounding ring: expand bbox, then exclude the original bbox.
+    pad_x = max(8, int(0.55 * bw))
+    pad_y = max(8, int(0.55 * bh))
+
+    ox1 = max(0, x1 - pad_x)
+    oy1 = max(0, y1 - pad_y)
+    ox2 = min(w, x2 + pad_x)
+    oy2 = min(h, y2 + pad_y)
+
+    outer = depth[oy1:oy2, ox1:ox2].copy()
+
+    inner_x1 = x1 - ox1
+    inner_y1 = y1 - oy1
+    inner_x2 = x2 - ox1
+    inner_y2 = y2 - oy1
+
+    ring_mask = np.ones(
+        outer.shape,
+        dtype=bool,
+    )
+    ring_mask[
+        inner_y1:inner_y2,
+        inner_x1:inner_x2,
+    ] = False
+
+    surround_vals = outer[
+        ring_mask & np.isfinite(outer)
+    ]
+
+    if core_vals.size < 8 or surround_vals.size < 20:
+        return float("nan"), float("nan")
+
+    return (
+        float(np.median(core_vals)),
+        float(np.median(surround_vals)),
+    )
+
+
+def midas_relative_correction(raw_depth, box, frame_shape):
+    """Convert MiDaS relative depth contrast into a bounded distance correction.
+
+    A larger MiDaS depth in the object core than in the surrounding region
+    means the object is locally closer. The correction is intentionally bounded
+    so MiDaS cannot catastrophically override the calibrated YOLO anchor.
+    """
+    obj_depth, bg_depth = _depth_core_and_surrounding(
+        raw_depth,
+        box,
+        frame_shape,
+    )
+
+    if (
+        not np.isfinite(obj_depth)
+        or not np.isfinite(bg_depth)
+        or bg_depth <= 1e-6
+    ):
+        return 1.0, obj_depth, bg_depth, 0.0
+
+    ratio = float(
+        np.clip(
+            obj_depth / bg_depth,
+            MIDAS_RATIO_MIN,
+            MIDAS_RATIO_MAX,
+        )
+    )
+
+    # Stronger local protrusion => stronger correction, but still bounded.
+    correction = float(
+        np.clip(
+            ratio ** (-MIDAS_CORRECTION_GAMMA),
+            MIDAS_CORRECTION_MIN,
+            MIDAS_CORRECTION_MAX,
+        )
+    )
+
+    strength = float(
+        np.clip(
+            abs(np.log(max(ratio, 1e-6)))
+            / abs(np.log(1.45)),
+            0.0,
+            1.0,
+        )
+    )
+
+    return correction, obj_depth, bg_depth, strength
+
+
 class Track:
     """One tracked object's identity + rolling history across frames."""
     _next_id = 1
 
-    def __init__(self, cls_name, centroid, dist, now):
+    def __init__(self, cls_name, centroid, dist, now, box=None, frame_area=None):
         self.id = Track._next_id
         Track._next_id += 1
         self.cls_name = cls_name
         self.source = "YOLO"
         self.centroid = centroid
-        self.box = None
-        self.smoothed_dist = dist
-        self.history = [(now, dist)]   # (timestamp, smoothed_dist), capped to SPEED_WINDOW
+        self.box = box
+
+        # Reference established from the first stable observations. The
+        # calibrated initial distance remains the metric anchor; later
+        # distance changes come from tracked apparent-size change.
+        self.reference_area_frac = None
+        self.reference_distance = None
+        self.area_ema_frac = None
+        self.reference_observations = []
+        self.reference_locked = False
+
+        if box is not None and frame_area:
+            x1, y1, x2, y2 = box
+            area_frac = max(
+                ((x2 - x1) * (y2 - y1)) / max(frame_area, 1),
+                TRACK_REFERENCE_MIN_AREA_FRAC,
+            )
+            if TRACK_REFERENCE_MIN_AREA_FRAC <= area_frac <= TRACK_REFERENCE_MAX_AREA_FRAC:
+                self.reference_observations.append((area_frac, dist))
+                self.area_ema_frac = area_frac
+
+        self.smoothed_dist = float(dist)
+        self.distance_history = deque(
+            [float(dist)],
+            maxlen=DIST_FUSION_MEDIAN_WINDOW,
+        )
+        self.history = [(now, float(dist))]
         self.filtered_closing_speed = 0.0
         self.last_seen = now
+        self.last_yolo_distance = float(dist)
+        self.last_midas_ratio = 1.0
+        self.last_midas_correction = 1.0
+        self.last_midas_strength = 0.0
 
-    def update(self, cls_name, centroid, box, raw_dist, now):
-        self.cls_name = cls_name       # allow class to be re-confirmed each frame
+    def _update_reference(self, area_frac, calibrated_dist):
+        if self.reference_locked:
+            return
+
+        self.reference_observations.append(
+            (area_frac, calibrated_dist)
+        )
+
+        if len(self.reference_observations) < TRACK_REFERENCE_FRAMES:
+            return
+
+        areas = np.asarray(
+            [a for a, _ in self.reference_observations],
+            dtype=np.float64,
+        )
+        dists = np.asarray(
+            [d for _, d in self.reference_observations],
+            dtype=np.float64,
+        )
+
+        self.reference_area_frac = float(np.median(areas))
+        self.reference_distance = float(np.median(dists))
+        self.reference_locked = True
+
+    def _tracked_distance(self, area_frac, fallback_dist):
+        if self.reference_locked and self.reference_area_frac is not None:
+            # Same empirical exponent as the existing calibration, but applied
+            # to the CHANGE in apparent area relative to this object's traced
+            # reference box. This is the key difference from recalibrating a
+            # fresh absolute distance from every noisy detection box.
+            ratio = self.reference_area_frac / max(
+                area_frac,
+                TRACK_REFERENCE_MIN_AREA_FRAC,
+            )
+            estimated = self.reference_distance * (ratio ** DIST_EXPONENT)
+            return float(
+                np.clip(
+                    estimated,
+                    0.2,
+                    MAX_RANGE,
+                )
+            )
+        return float(fallback_dist)
+
+    def update(self, cls_name, centroid, box, raw_dist, now, frame_area):
+        self.cls_name = cls_name
         self.centroid = centroid
-        self.box = box
+
+        if self.box is None:
+            self.box = box
+        else:
+            px1, py1, px2, py2 = map(float, self.box)
+            nx1, ny1, nx2, ny2 = map(float, box)
+            pw, ph = max(px2-px1, 1.0), max(py2-py1, 1.0)
+            nw, nh = max(nx2-nx1, 1.0), max(ny2-ny1, 1.0)
+            nw = float(np.clip(nw, pw*0.78, pw*1.28))
+            nh = float(np.clip(nh, ph*0.78, ph*1.28))
+            ncx = 0.30*((nx1+nx2)/2.0) + 0.70*((px1+px2)/2.0)
+            ncy = 0.30*((ny1+ny2)/2.0) + 0.70*((py1+py2)/2.0)
+            self.box = (
+                int(ncx - nw/2.0), int(ncy - nh/2.0),
+                int(ncx + nw/2.0), int(ncy + nh/2.0),
+            )
+
+        x1, y1, x2, y2 = self.box
+        area_frac = max(
+            ((x2 - x1) * (y2 - y1)) / max(frame_area, 1),
+            TRACK_REFERENCE_MIN_AREA_FRAC,
+        )
+        area_frac = float(
+            np.clip(
+                area_frac,
+                TRACK_REFERENCE_MIN_AREA_FRAC,
+                TRACK_REFERENCE_MAX_AREA_FRAC,
+            )
+        )
+
+        if self.area_ema_frac is None:
+            self.area_ema_frac = area_frac
+        else:
+            self.area_ema_frac = (
+                TRACK_AREA_EMA_ALPHA * area_frac
+                + (1.0 - TRACK_AREA_EMA_ALPHA) * self.area_ema_frac
+            )
+
+        # raw_dist is now the already-fused metric estimate. The old
+        # first-bbox reference mechanism is deliberately disabled because it
+        # could permanently anchor a track to an incorrect initial distance.
+        fused_dist = float(raw_dist)
+        self.last_yolo_distance = fused_dist
+
+        self.distance_history.append(fused_dist)
+
+        # Robust temporal aggregation first, then a light EMA.
+        median_dist = float(
+            np.median(
+                np.asarray(
+                    self.distance_history,
+                    dtype=np.float64,
+                )
+            )
+        )
+
         self.smoothed_dist = (
-            EMA_ALPHA * raw_dist + (1 - EMA_ALPHA) * self.smoothed_dist
+            TRACK_DISTANCE_EMA_ALPHA * median_dist
+            + (1.0 - TRACK_DISTANCE_EMA_ALPHA) * self.smoothed_dist
         )
         self.history.append((now, self.smoothed_dist))
         if len(self.history) > SPEED_WINDOW:
@@ -286,7 +659,7 @@ class Track:
         return self.smoothed_dist / speed
 
 
-def match_detections_to_tracks(detections, tracks, frame_width, now):
+def match_detections_to_tracks(detections, tracks, frame_width, frame_height, now):
     """Greedy centroid+class matching: each detection claims the closest
     unclaimed track of the same class within MATCH_MAX_DIST_FRAC, else
     spawns a new track."""
@@ -304,11 +677,11 @@ def match_detections_to_tracks(detections, tracks, frame_width, now):
                 best_track, best_dist = tr, d
 
         if best_track is not None:
-            best_track.update(cls_name, centroid, box, raw_dist, now)
+            best_track.update(cls_name, centroid, box, raw_dist, now, frame_width * frame_height)
             unmatched_tracks.remove(best_track)
             updated.append(best_track)
         else:
-            new_track = Track(cls_name, centroid, raw_dist, now)
+            new_track = Track(cls_name, centroid, raw_dist, now, box=box, frame_area=frame_width * frame_height)
             new_track.box = box
             updated.append(new_track)
 
@@ -320,6 +693,20 @@ def match_detections_to_tracks(detections, tracks, frame_width, now):
     # cap total tracks -- keep the ones with lowest current distance
     updated.sort(key=lambda t: t.smoothed_dist)
     return updated[:MAX_TRACKS]
+
+
+def current_yolo_anchor_distance(track, frame_area):
+    """Recover the original calibrated YOLO bbox-area estimate for diagnostics."""
+    if track is None or track.box is None:
+        return float(MAX_RANGE)
+    x1, y1, x2, y2 = map(int, track.box)
+    bw = max(0, x2 - x1)
+    bh = max(0, y2 - y1)
+    area_frac = (
+        (bw * bh)
+        / max(float(frame_area), 1.0)
+    )
+    return bbox_area_to_distance(area_frac)
 
 
 def risk_bucket(risk):
@@ -383,10 +770,9 @@ def combine_risk(gru_risk, proximity_level):
 def unknown_obstacle_risk(unknown_candidates, frame_height):
     """Return a deterministic safety floor for confirmed MiDaS obstacles.
 
-    Metric distance/TTC for the GRU path are computed separately from the
-    confirmed obstacle bounding box using the same calibrated bbox-area
-    heuristic as the YOLO path. MiDaS relative depth itself is not treated as
-    metric distance.
+    Metric distance/TTC for MiDaS-only obstacles are computed from raw MiDaS
+    depth using the separate online MiDaS metric calibrator. MiDaS bbox area is
+    never passed through the YOLO distance calibration.
     """
     confirmed = [
         c for c in unknown_candidates
@@ -717,20 +1103,21 @@ def preprocess_midas(frame):
 
 def midas_infer(compiled_model, frame):
     result = compiled_model([preprocess_midas(frame)])
-    depth = np.asarray(
+    depth_raw = np.asarray(
         result[compiled_model.output(0)],
         dtype=np.float32,
     ).squeeze()
 
-    # Relative-depth normalization for visualization only.
-    lo = float(np.percentile(depth, 2))
-    hi = float(np.percentile(depth, 98))
-
-    return np.clip(
-        (depth - lo) / max(hi - lo, 1e-6),
+    # Per-frame normalization is only for visualization/detection. Preserve the
+    # raw model output for metric calibration.
+    lo = float(np.percentile(depth_raw, 2))
+    hi = float(np.percentile(depth_raw, 98))
+    depth_norm = np.clip(
+        (depth_raw - lo) / max(hi - lo, 1e-6),
         0.0,
         1.0,
     )
+    return depth_norm, depth_raw
 
 
 def midas_visual(depth_norm, width, height):
@@ -760,6 +1147,7 @@ class AsyncMidasWorker:
         self._lock = threading.Lock()
         self._latest_frame = None
         self._latest_depth = None
+        self._latest_raw_depth = None
         self._result_id = 0
         self._consumed_result_id = 0
 
@@ -788,14 +1176,14 @@ class AsyncMidasWorker:
             return self._latest_depth.copy()
 
     def get_new_result(self):
-        """Return a completed depth map exactly once per MiDaS inference."""
+        """Return (normalized_depth, raw_depth) once per MiDaS inference."""
         with self._lock:
-            if self._latest_depth is None:
+            if self._latest_depth is None or self._latest_raw_depth is None:
                 return None
             if self._result_id == self._consumed_result_id:
                 return None
             self._consumed_result_id = self._result_id
-            return self._latest_depth.copy()
+            return self._latest_depth.copy(), self._latest_raw_depth.copy()
 
     def stop(self):
         self._stop.set()
@@ -819,13 +1207,14 @@ class AsyncMidasWorker:
                 continue
 
             try:
-                depth = midas_infer(
+                depth_norm, depth_raw = midas_infer(
                     self.compiled_model,
                     frame,
                 )
 
                 with self._lock:
-                    self._latest_depth = depth
+                    self._latest_depth = depth_norm
+                    self._latest_raw_depth = depth_raw
                     self._result_id += 1
 
             except Exception as e:
@@ -835,107 +1224,16 @@ class AsyncMidasWorker:
 # ---- PROVEN MiDaS UNKNOWN-OBSTACLE DETECTOR ----
 
 def grow_depth_region(depth, seed_box, seed_depth, frame_shape):
-    """Grow a small MiDaS protrusion seed into its coherent depth region.
+    """V14: disabled depth-plateau growth.
 
-    MiDaS relative depth is spatially smooth inside many real objects, while
-    the protrusion mask intentionally keeps only strong local residuals.
-    Starting from the protrusion seed and growing through a depth band gives
-    a much more complete object bbox without turning a smooth floor into an
-    obstacle on its own.
+    The protrusion mask is the trusted geometry source. Growing a seed through
+    a broad relative-depth plateau can absorb desks, laptops, walls or floors
+    that happen to have similar MiDaS values. Return the actual mask component
+    bbox unchanged; fragment grouping is handled separately by
+    merge_midas_candidates().
     """
-    h, w = frame_shape[:2]
     x, y, bw, bh = [int(v) for v in seed_box]
-
-    pad_x = max(int(w * DEPTH_GROW_RADIUS_FRAC), int(bw * 1.5), 24)
-    pad_y = max(int(h * DEPTH_GROW_RADIUS_FRAC), int(bh * 1.0), 24)
-
-    x0 = max(0, x - pad_x)
-    y0 = max(0, y - pad_y)
-    x1 = min(w, x + bw + pad_x)
-    y1 = min(h, y + bh + pad_y)
-
-    local = depth[y0:y1, x0:x1].astype(np.float32)
-    if local.size == 0:
-        return (x, y, bw, bh), 0.0
-
-    # The seed depth is a robust median rather than one pixel. Keep pixels
-    # whose depth is sufficiently close to the seed and not substantially
-    # farther away. This follows the object's depth plateau.
-    seed_x0 = max(0, x - x0)
-    seed_y0 = max(0, y - y0)
-    seed_x1 = min(local.shape[1], x + bw - x0)
-    seed_y1 = min(local.shape[0], y + bh - y0)
-
-    seed_patch = local[seed_y0:seed_y1, seed_x0:seed_x1]
-    if seed_patch.size == 0:
-        return (x, y, bw, bh), 0.0
-
-    seed_level = float(np.median(seed_patch))
-    if not np.isfinite(seed_level):
-        seed_level = float(seed_depth)
-
-    # Permit the surrounding object to be slightly less near than the edge
-    # that triggered the protrusion detector. Also keep a lower bound based
-    # on the seed's actual depth.
-    lo = max(0.0, seed_level - DEPTH_GROW_TOLERANCE)
-    hi = min(1.0, seed_level + 0.045)
-
-    region = ((local >= lo) & (local <= hi)).astype(np.uint8) * 255
-
-    # Remove isolated depth speckle, then close small holes inside an object.
-    k3 = np.ones((3, 3), np.uint8)
-    region = cv2.morphologyEx(region, cv2.MORPH_OPEN, k3)
-    region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-
-    # Use the protrusion as a SEED and select the complete connected component
-    # in the local depth band that contains that seed. The previous V7 code
-    # intersected the depth region with a small dilation of the seed, which
-    # accidentally clipped the object back down to a tiny bbox.
-    seed_mask = np.zeros_like(region)
-    seed_mask[seed_y0:seed_y1, seed_x0:seed_x1] = 255
-    seed_mask = cv2.dilate(seed_mask, np.ones((7, 7), np.uint8), iterations=1)
-
-    n2, labels2, stats2, _ = cv2.connectedComponentsWithStats(region, 8)
-    if n2 <= 1:
-        return (x, y, bw, bh), 0.0
-
-    # Pick the depth-band component with the greatest overlap with the seed.
-    # This preserves the seed's identity while allowing the bbox to cover the
-    # entire coherent object region.
-    overlap_scores = np.zeros(n2, dtype=np.int32)
-    seed_bool = seed_mask > 0
-    for lab in range(1, n2):
-        overlap_scores[lab] = int(np.count_nonzero((labels2 == lab) & seed_bool))
-
-    best_label = int(np.argmax(overlap_scores[1:])) + 1
-    if overlap_scores[best_label] <= 0:
-        return (x, y, bw, bh), 0.0
-    area = int(stats2[best_label, cv2.CC_STAT_AREA])
-    local_area_frac = area / max(float(local.shape[0] * local.shape[1]), 1.0)
-
-    # Sanity bound: a grown region occupying almost the entire search window
-    # is almost certainly a background plane rather than a discrete object.
-    frame_area = float(h * w)
-    full_area_frac = area / max(frame_area, 1.0)
-    if local_area_frac < DEPTH_GROW_MIN_COMPONENT_FRAC or full_area_frac > DEPTH_GROW_MAX_COMPONENT_FRAC:
-        return (x, y, bw, bh), 0.0
-
-    yy, xx = np.where(labels2 == best_label)
-    if len(xx) == 0:
-        return (x, y, bw, bh), 0.0
-
-    gx0 = x0 + int(xx.min())
-    gy0 = y0 + int(yy.min())
-    gx1 = x0 + int(xx.max()) + 1
-    gy1 = y0 + int(yy.max()) + 1
-
-    return (
-        gx0,
-        gy0,
-        max(1, gx1 - gx0),
-        max(1, gy1 - gy0),
-    ), float(full_area_frac)
-
+    return (x, y, bw, bh), float((bw * bh) / max(float(frame_shape[0] * frame_shape[1]), 1.0))
 
 def analyze_depth(depth_norm, frame_shape):
     """
@@ -1050,7 +1348,7 @@ def analyze_depth(depth_norm, frame_shape):
     )
 
     residual_threshold = max(
-        0.035,
+        0.055,
         residual_med
         + 3.0 * residual_mad,
     )
@@ -1198,49 +1496,28 @@ def analyze_depth(depth_norm, frame_shape):
         else:
             zone = "RIGHT"
 
-        # The protrusion component is a SEED, not necessarily the whole
-        # object. Grow it through the local depth plateau before constructing
-        # the navigation bbox. This is the key fix for the "tiny bbox on a
-        # large bag" behavior visible in V6/V7.
-        grown_box, grown_area_frac = grow_depth_region(
-            depth,
-            (x, y + y0, bw, bh),
-            depth_level,
-            frame_shape,
-        )
+        # V14: the connected protrusion component is the navigation geometry.
+        # Do not expand it using a depth plateau. The black/white mask is the
+        # most reliable boundary signal we currently have from MiDaS.
+        final_box = (x, y + y0, bw, bh)
+        grown_area_frac = (bw * bh) / max(float(w * h), 1.0)
 
-        # Score the grown region only after it has been computed. V7 had a
-        # variable-order bug here: grown_area_frac was referenced before
-        # assignment, causing the detector to fail on every frame.
+        # Candidate quality score. This is the same scoring rule used by the
+        # proven standalone MiDaS detector. V17 previously referenced `score`
+        # before defining it, which caused every MiDaS candidate pass to fail.
         score = (
-            min(
-                contrast / 0.16,
-                1.0,
-            ) * 0.50
-            + min(
-                edge_support / 0.50,
-                1.0,
-            ) * 0.20
-            + min(
-                fill / 0.70,
-                1.0,
-            ) * 0.15
+            min(contrast / 0.16, 1.0) * 0.50
+            + min(edge_support / 0.50, 1.0) * 0.20
+            + min(fill / 0.70, 1.0) * 0.15
             + depth_level * 0.15
-            + min(grown_area_frac / 0.08, 1.0) * 0.05
         )
-
-        gx, gy, gbw, gbh = grown_box
-        if gbw >= bw and gbh >= bh:
-            final_box = (gx, gy, gbw, gbh)
-        else:
-            final_box = (x, y + y0, bw, bh)
 
         # Reject tiny navigation boxes. The protrusion mask can contain a
         # mathematically valid but physically meaningless speck; those should
         # never become a tracked obstacle. Keep this conservative because YOLO
         # remains responsible for known classes and MiDaS is the fallback.
         fx, fy, fw, fh = final_box
-        if fw < int(w * 0.045) or fh < int(h * 0.055):
+        if fw < int(w * 0.030) or fh < int(h * 0.040):
             continue
 
         candidates.append({
@@ -1406,7 +1683,28 @@ def stabilize_candidates(candidates, state):
 
     return stable
 
-def update_unknown_tracks(raw_candidates, stable_candidates, unknown_tracks, now, frame_area):
+def raw_midas_depth_for_box(raw_depth, box, frame_shape):
+    """Robust raw MiDaS depth statistic inside a native-frame bbox."""
+    if raw_depth is None or not isinstance(raw_depth, np.ndarray) or raw_depth.size == 0:
+        return float("nan")
+    h, w = frame_shape[:2]
+    depth_full = cv2.resize(raw_depth, (w, h), interpolation=cv2.INTER_LINEAR)
+    x, y, bw, bh = [int(v) for v in box]
+    x0 = max(0, min(w - 1, x)); y0 = max(0, min(h - 1, y))
+    x1 = max(x0 + 1, min(w, x + bw)); y1 = max(y0 + 1, min(h, y + bh))
+    patch = depth_full[y0:y1, x0:x1].astype(np.float32)
+    if patch.size == 0:
+        return float("nan")
+    py0, py1 = int(patch.shape[0]*0.15), max(int(patch.shape[0]*0.85), 1)
+    px0, px1 = int(patch.shape[1]*0.15), max(int(patch.shape[1]*0.85), 1)
+    core = patch[py0:py1, px0:px1]
+    vals = core[np.isfinite(core)]
+    if vals.size < 8:
+        vals = patch[np.isfinite(patch)]
+    return float(np.median(vals)) if vals.size else float("nan")
+
+
+def update_unknown_tracks(raw_candidates, stable_candidates, unknown_tracks, now, frame_area, raw_midas_depth, frame_shape, midas_calibrator):
     """Maintain one metric-distance/TTC track per MiDaS navigation zone.
 
     Raw MiDaS candidates update the distance history every depth result, so
@@ -1432,8 +1730,10 @@ def update_unknown_tracks(raw_candidates, stable_candidates, unknown_tracks, now
         measurement = stable_by_zone.get(zone, candidate)
         x, y, bw, bh = measurement["box"]
         centroid = (x + bw / 2.0, y + bh / 2.0)
-        area_frac = (bw * bh) / max(float(frame_area), 1.0)
-        measured_dist = bbox_area_to_distance(area_frac)
+        raw_midas = raw_midas_depth_for_box(
+            raw_midas_depth, (x, y, bw, bh), frame_shape
+        )
+        measured_dist, metric_ready = midas_calibrator.predict(raw_midas)
 
         tr = unknown_tracks.get(zone)
         if tr is None:
@@ -1448,6 +1748,7 @@ def update_unknown_tracks(raw_candidates, stable_candidates, unknown_tracks, now
                 (x, y, x + bw, y + bh),
                 measured_dist,
                 now,
+                frame_area,
             )
             tr.source = "MiDaS"
 
@@ -1526,7 +1827,7 @@ def boxes_same_object(a, b):
     y_overlap = max(0.0, min(ay2,by2)-max(ay1,by1)) / max(1.0, min(ah,bh))
 
     return (
-        iou >= 0.10
+        iou >= 0.15
         or containment >= YOLO_MIDAS_MIN_CONTAINMENT
         or (x_overlap >= 0.45 and y_overlap >= 0.30)
         or (center_dist <= YOLO_MIDAS_CENTER_FRAC * max(aw,ah,bw,bh,diag)
@@ -1569,6 +1870,13 @@ def merge_midas_candidates(candidates, frame_w, frame_h):
 
     def should_merge(a,b):
         ab=xyxy(a); bb=xyxy(b)
+        # Never allow fragment chaining to create a giant physical-object box.
+        ux1=min(ab[0],bb[0]); uy1=min(ab[1],bb[1])
+        ux2=max(ab[2],bb[2]); uy2=max(ab[3],bb[3])
+        uw=ux2-ux1; uh=uy2-uy1
+        if (uw > frame_w*0.58 or uh > frame_h*0.62 or
+                uw*uh > frame_w*frame_h*0.20):
+            return False
         if not depth_similar(a,b):
             return False
         iou=box_iou_xyxy(ab,bb)
@@ -1583,16 +1891,16 @@ def merge_midas_candidates(candidates, frame_w, frame_h):
 
         # Pieces of the same object commonly touch/approach each other with
         # substantial overlap in one axis.
-        if xgap <= frame_w*MIDAS_MERGE_GAP_FRAC and yover >= MIDAS_MERGE_MIN_OVERLAP:
+        if xgap <= frame_w*MIDAS_MERGE_GAP_FRAC_V14 and yover >= MIDAS_MERGE_MIN_OVERLAP_V14:
             return True
-        if ygap <= frame_h*MIDAS_MERGE_GAP_FRAC and xover >= MIDAS_MERGE_MIN_OVERLAP:
+        if ygap <= frame_h*MIDAS_MERGE_GAP_FRAC_V14 and xover >= MIDAS_MERGE_MIN_OVERLAP_V14:
             return True
 
         acx=(ax1+ax2)/2; acy=(ay1+ay2)/2
         bcx=(bx1+bx2)/2; bcy=(by1+by2)/2
         center_dist=((acx-bcx)**2+(acy-bcy)**2)**0.5
         scale=max(ax2-ax1,ay2-ay1,bx2-bx1,by2-by1,1.0)
-        return center_dist <= MIDAS_MERGE_CENTER_FRAC*scale and (xover>=0.10 or yover>=0.10)
+        return center_dist <= MIDAS_MERGE_CENTER_FRAC_V14*scale and (xover>=0.10 or yover>=0.10)
 
     changed=True
     while changed and len(work)>1:
@@ -1612,7 +1920,8 @@ def merge_midas_candidates(candidates, frame_w, frame_h):
         a=work[i]; b=work[j]
         u=union_box(xyxy(a),xyxy(b))
         ux1,uy1,ux2,uy2=u
-        a["box"]=(int(ux1),int(uy1),int(ux2-ux1),int(uy2-uy1))
+        new_box = (int(ux1), int(uy1), int(ux2-ux1), int(uy2-uy1))
+        a["box"] = new_box
         for k in ("score","depth_level","grown_area_frac","component_fill","depth_contrast","edge_support"):
             a[k]=max(float(a.get(k,0.0)),float(b.get(k,0.0)))
         a["area"]=int(a.get("area",0))+int(b.get("area",0))
@@ -1642,6 +1951,7 @@ def main():
 
     midas_worker = AsyncMidasWorker(midas_model)
     midas_worker.start()
+    midas_calibrator = MidasMetricCalibrator()
 
     reader = LatestFrameReader(SOURCE)
 
@@ -1663,6 +1973,7 @@ def main():
     midas_counter = 0
 
     latest_midas_depth = None
+    latest_midas_raw_depth = None
     latest_unknown_mask = None
     unknown_candidates = []
     raw_unknown_candidates = []
@@ -1684,7 +1995,7 @@ def main():
     print("Temporal stability: 3/5 frames")
     print("Unknown obstacle: unified distance/TTC/GRU path + safety floor.")
     print("Depth/BW panel: persistent after first valid MiDaS result.")
-    print("MiDaS bbox: depth-region grown + temporally constrained.")
+    print("MiDaS bbox: protrusion-mask geometry only + balanced fragment merge.")
     print("Press 'q' to quit.")
 
     try:
@@ -1755,12 +2066,15 @@ def main():
 
             depth_result = midas_worker.get_new_result()
 
-            if (
-                depth_result is not None
-                and isinstance(depth_result, np.ndarray)
-                and depth_result.size > 0
-            ):
-                latest_midas_depth = depth_result
+            if depth_result is not None:
+                latest_midas_depth, latest_midas_raw_depth = depth_result
+                if (
+                    not isinstance(latest_midas_depth, np.ndarray)
+                    or not isinstance(latest_midas_raw_depth, np.ndarray)
+                    or latest_midas_depth.size == 0
+                    or latest_midas_raw_depth.size == 0
+                ):
+                    continue
                 have_depth_result = True
 
                 # Calculate/update the B/W mask every time we receive a new
@@ -1852,16 +2166,69 @@ def main():
                     )
                 )
 
-                raw_dist = bbox_area_to_distance(
+                yolo_dist = bbox_area_to_distance(
                     area_frac
                 )
+
+                # Fuse the calibrated YOLO metric anchor with local MiDaS
+                # depth evidence. MiDaS is never interpreted as metres here.
+                fused_dist = yolo_dist
+                midas_corr = 1.0
+                midas_ratio = 1.0
+                midas_strength = 0.0
+
+                if (
+                    DIST_FUSION_ENABLED
+                    and latest_midas_raw_depth is not None
+                ):
+                    (
+                        midas_corr,
+                        obj_depth,
+                        bg_depth,
+                        midas_strength,
+                    ) = midas_relative_correction(
+                        latest_midas_raw_depth,
+                        box_px,
+                        frame.shape,
+                    )
+
+                    if (
+                        np.isfinite(obj_depth)
+                        and np.isfinite(bg_depth)
+                        and bg_depth > 1e-6
+                    ):
+                        midas_ratio = float(
+                            np.clip(
+                                obj_depth / bg_depth,
+                                MIDAS_RATIO_MIN,
+                                MIDAS_RATIO_MAX,
+                            )
+                        )
+
+                        # Trust the correction only in proportion to local
+                        # depth evidence; weak/ambiguous MiDaS contrast stays
+                        # close to the original YOLO metric estimate.
+                        effective_corr = (
+                            1.0
+                            + (
+                                midas_corr - 1.0
+                            ) * midas_strength
+                        )
+
+                        fused_dist = float(
+                            np.clip(
+                                yolo_dist * effective_corr,
+                                0.2,
+                                MAX_RANGE,
+                            )
+                        )
 
                 detections.append(
                     (
                         mapped,
                         centroid,
                         box_px,
-                        raw_dist,
+                        fused_dist,
                     )
                 )
 
@@ -1920,13 +2287,17 @@ def main():
                         used_midas.add(idx)
                         fused_zones.add(uc["zone"])
 
-                        # YOLO supplies semantic identity. MiDaS supplies the
-                        # larger physical extent. Do NOT create a second box.
+                        # YOLO supplies semantic identity AND metric distance.
+                        # MiDaS supplies geometry only for this fused object.
+                        # Learn the separate MiDaS metric mapping from this pair.
+                        if latest_midas_raw_depth is not None:
+                            midas_raw = raw_midas_depth_for_box(
+                                latest_midas_raw_depth, uc["box"], frame.shape
+                            )
+                            midas_calibrator.add(midas_raw, raw_dist)
+
                         box_px = union_box(box_px, ub)
                         x1, y1, x2, y2 = box_px
-                        raw_dist = bbox_area_to_distance(
-                            ((x2 - x1) * (y2 - y1)) / max(w * h, 1)
-                        )
                         centroid = (
                             (x1 + x2) / 2.0,
                             (y1 + y2) / 2.0,
@@ -1938,12 +2309,70 @@ def main():
 
                 detections = fused_detections
 
+            # Keep frame-local fusion diagnostics keyed by bbox.
+            fusion_diag = {}
+            for _mapped, _centroid, _box, _fused_dist in detections:
+                _area_frac = (
+                    ((_box[2] - _box[0]) * (_box[3] - _box[1]))
+                    / max(float(w * h), 1.0)
+                )
+                _yolo_anchor = bbox_area_to_distance(_area_frac)
+                _corr = 1.0
+                _ratio = 1.0
+                _strength = 0.0
+                if (
+                    DIST_FUSION_ENABLED
+                    and latest_midas_raw_depth is not None
+                ):
+                    (
+                        _corr_raw,
+                        _obj_d,
+                        _bg_d,
+                        _strength,
+                    ) = midas_relative_correction(
+                        latest_midas_raw_depth,
+                        _box,
+                        frame.shape,
+                    )
+                    if np.isfinite(_obj_d) and np.isfinite(_bg_d) and _bg_d > 1e-6:
+                        _ratio = float(
+                            np.clip(
+                                _obj_d / _bg_d,
+                                MIDAS_RATIO_MIN,
+                                MIDAS_RATIO_MAX,
+                            )
+                        )
+                        _corr = float(
+                            1.0
+                            + (_corr_raw - 1.0) * _strength
+                        )
+                fusion_diag[_box] = (
+                    _yolo_anchor,
+                    _corr,
+                    _ratio,
+                    _strength,
+                )
+
             tracks = match_detections_to_tracks(
                 detections,
                 tracks,
                 w,
+                h,
                 now,
             )
+
+            for tr in tracks:
+                if tr.box is not None:
+                    diag = fusion_diag.get(
+                        tuple(map(int, tr.box))
+                    )
+                    if diag is not None:
+                        (
+                            tr.last_yolo_distance,
+                            tr.last_midas_correction,
+                            tr.last_midas_ratio,
+                            tr.last_midas_strength,
+                        ) = diag
 
             for tr in tracks:
                 tr.source = "YOLO"
@@ -1969,6 +2398,9 @@ def main():
                 unknown_tracks,
                 now,
                 w * h,
+                latest_midas_raw_depth,
+                frame.shape,
+                midas_calibrator,
             )
 
             # A final geometric duplicate check protects against cases where
@@ -2146,6 +2578,19 @@ def main():
                 selected_is_unknown = False
 
             # ---------------------------------------------------------
+            # Existing GRU / proximity path — unchanged except that `dist`
+            # is now the fused/aggregated metric estimate.
+            # ---------------------------------------------------------
+            yolo_anchor_dist = (
+                current_yolo_anchor_distance(
+                    selected,
+                    w * h,
+                )
+                if selected is not None
+                else MAX_RANGE
+            )
+
+            # ---------------------------------------------------------
             # Existing GRU / proximity path — unchanged
             # ---------------------------------------------------------
             cls_idx = FEATURE_CLASSES.index(
@@ -2286,11 +2731,28 @@ def main():
             cv2.putText(
                 frame,
                 (
+                    f"FUSION: YOLO={yolo_anchor_dist:.2f}m "
+                    f"FINAL={dist:.2f}m "
+                    f"MiDaS-CORR="
+                    f"{getattr(selected, 'last_midas_correction', 1.0):.2f}"
+                    if selected is not None
+                    else "FUSION: YOLO=-- FINAL=-- MiDaS-CORR=--"
+                ),
+                (10, 108),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                (255, 255, 0),
+                2,
+            )
+
+            cv2.putText(
+                frame,
+                (
                     f"PROXIMITY: {proximity_level} | "
                     f"FINAL: {final_risk:.3f} "
                     f"{final_bucket}"
                 ),
-                (10, 108),
+                (10, 134),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.60,
                 (0, 0, 255),
@@ -2303,7 +2765,7 @@ def main():
                     f"Reason: {proximity_reason} | "
                     f"tracks={len(final_obstacles)}"
                 ),
-                (10, 134),
+                (10, 160),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.48,
                 (0, 0, 255),
@@ -2368,6 +2830,18 @@ def main():
                 1,
             )
 
+            distance_mode = "TRACK-REF" if selected is not None and getattr(selected, "reference_locked", False) else "CALIBRATING"
+
+            cv2.putText(
+                frame,
+                f"DIST MODE: {distance_mode}",
+                (10, 184),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (0, 0, 255),
+                1,
+            )
+
             cv2.putText(
                 frame,
                 f"FPS: {fps:.1f}",
@@ -2375,6 +2849,22 @@ def main():
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.48,
                 (0, 0, 255),
+                1,
+            )
+
+            metric_status = (
+                f"MiDaS metric: CALIBRATED ({len(midas_calibrator.samples)})"
+                if midas_calibrator.ready
+                else f"MiDaS metric: UNCALIBRATED ({len(midas_calibrator.samples)}/3)"
+            )
+
+            cv2.putText(
+                frame,
+                metric_status,
+                (10, 231),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.46,
+                (0, 255, 255),
                 1,
             )
 
@@ -2483,10 +2973,41 @@ def main():
                     frame,
                 )
 
-            if (
-                cv2.waitKey(1) & 0xFF
-                == ord("q")
-            ):
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("c"):
+                if selected is None:
+                    print("MiDaS calibration: no selected obstacle.")
+                elif latest_midas_raw_depth is None or selected.box is None:
+                    print("MiDaS calibration: no raw MiDaS depth available.")
+                else:
+                    try:
+                        raw_value = raw_midas_depth_for_box(
+                            latest_midas_raw_depth,
+                            selected.box,
+                            frame.shape,
+                        )
+                        entered = input(
+                            "\nTRUE distance for the selected object (metres): "
+                        ).strip()
+                        true_dist = float(entered)
+                        if midas_calibrator.add(raw_value, true_dist):
+                            print(
+                                f"Captured MiDaS calibration: raw={raw_value:.5f} "
+                                f"-> {true_dist:.3f}m"
+                            )
+                        else:
+                            print("Invalid MiDaS calibration point; skipped.")
+                    except ValueError:
+                        print("Invalid distance; skipped.")
+                    except Exception as exc:
+                        print(f"MiDaS calibration warning: {exc}")
+
+            elif key == ord("x"):
+                midas_calibrator.clear()
+                print("MiDaS metric calibration cleared.")
+
+            elif key == ord("q"):
                 break
 
     finally:

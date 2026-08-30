@@ -38,7 +38,7 @@ import numpy as np
 from ultralytics import YOLO
 
 # ---------- Config -- MUST MATCH yolo_multiobject_tracking.py ----------
-SOURCE = "http://192.168.29.208:8080/video"   # sync this with your main script's SOURCE
+SOURCE = "http://192.168.29.115:8080/video"   # sync this with your main script's SOURCE
 MODEL = "yolov8n.pt"
 TARGET_CLASS = "person"
 
