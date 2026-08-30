@@ -2519,21 +2519,6 @@ def main():
                         1,
                     )
 
-                    cv2.putText(
-                        frame,
-                        f"{cls_name_raw} {confidence:.2f}",
-                        (
-                            box_px[0],
-                            max(
-                                box_px[1] - 4,
-                                10,
-                            ),
-                        ),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.4,
-                        (80, 80, 80),
-                        1,
-                    )
 
             # ---------------------------------------------------------
             # Unified obstacle selection from the FINAL top-3 set.
@@ -2553,14 +2538,6 @@ def main():
                 color = (0, 0, 255) if tr is selected else ((0, 255, 255) if is_unknown else (150, 150, 150))
 
                 cv2.rectangle(frame, tr.box[:2], tr.box[2:], color, 3)
-                label = "UNKNOWN" if is_unknown else tr.cls_name
-                cv2.putText(
-                    frame,
-                    f"{label} d={tr.smoothed_dist:.2f}m ttc={tr.ttc():.1f}s",
-                    (tr.box[0], max(tr.box[1] - 8, 12)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, color, 2,
-                )
 
             if selected is not None:
 
@@ -2683,194 +2660,179 @@ def main():
             )
 
             # ---------------------------------------------------------
-            # Overlay
+            # CLEAN THREE-PANEL DISPLAY
             # ---------------------------------------------------------
-            cv2.putText(
-                frame,
-                (
-                    f"SELECTED: {selected_source} {cls_name} "
-                    f"dist={dist:.2f}m "
-                    f"closing={closing_speed:+.2f}m/s "
-                    f"TTC={(selected.ttc() if selected is not None else TTC_SAFE_VALUE):.1f}s"
-                ),
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 0, 255),
-                2,
-            )
+            # No telemetry text is drawn over the camera/depth/mask images.
+            # Each panel gets its own dedicated information strip underneath.
 
-            cv2.putText(
-                frame,
-                (
-                    f"GRU: {live_risk:.3f} "
-                    f"GRU RISK: "
-                    f"{risk_bucket(live_risk)} "
-                    f"buffer={len(feature_buffer)}/{GRU_SEQ_LEN}"
-                ),
-                (10, 58),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.60,
-                (0, 0, 255),
-                2,
-            )
+            def _draw_status_panel(width, height, lines, bg=(28, 28, 28), fg=(235, 235, 235), title=None):
+                strip = np.full((height, width, 3), bg, dtype=np.uint8)
+                y = 25
+                if title:
+                    cv2.putText(
+                        strip, title, (10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                        fg, 2, cv2.LINE_AA,
+                    )
+                    y += 28
+                for text, color, scale, thickness in lines:
+                    if y >= height - 8:
+                        break
+                    cv2.putText(
+                        strip, text, (10, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale,
+                        color, thickness, cv2.LINE_AA,
+                    )
+                    y += 24
+                return strip
 
-            cv2.putText(
-                frame,
-                (
-                    f"GRU INPUT: d={dist:.2f}m close={closing_speed:+.2f} "
-                    f"class={cls_name}"
-                ),
-                (10, 82),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.50,
-                (255, 255, 255),
-                2,
-            )
-
-            cv2.putText(
-                frame,
-                (
-                    f"FUSION: YOLO={yolo_anchor_dist:.2f}m "
-                    f"FINAL={dist:.2f}m "
-                    f"MiDaS-CORR="
-                    f"{getattr(selected, 'last_midas_correction', 1.0):.2f}"
-                    if selected is not None
-                    else "FUSION: YOLO=-- FINAL=-- MiDaS-CORR=--"
-                ),
-                (10, 108),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.50,
-                (255, 255, 0),
-                2,
-            )
-
-            cv2.putText(
-                frame,
-                (
-                    f"PROXIMITY: {proximity_level} | "
-                    f"FINAL: {final_risk:.3f} "
-                    f"{final_bucket}"
-                ),
-                (10, 134),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.60,
-                (0, 0, 255),
-                2,
-            )
-
-            cv2.putText(
-                frame,
-                (
-                    f"Reason: {proximity_reason} | "
-                    f"tracks={len(final_obstacles)}"
-                ),
-                (10, 160),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (0, 0, 255),
-                1,
-            )
-
-            confirmed = [
-                c for c in unknown_candidates
-                if c.get(
-                    "stable_confirmed",
-                    False,
+            # Keep the displayed obstacle boxes, but put ALL descriptive text
+            # below the corresponding image instead of over it.
+            if selected is not None:
+                dist = selected.smoothed_dist
+                closing_speed = selected.closing_speed()
+                cls_name = selected.cls_name
+                selected_is_unknown = (
+                    getattr(selected, "source", "YOLO") == "MiDaS"
                 )
+            else:
+                dist = MAX_RANGE
+                closing_speed = 0.0
+                cls_name = "none"
+                selected_is_unknown = False
+
+            selected_source = (
+                "MiDaS UNKNOWN" if selected_is_unknown
+                else ("YOLO" if selected is not None else "NONE")
+            )
+            selected_ttc = (
+                selected.ttc() if selected is not None else TTC_SAFE_VALUE
+            )
+
+            # ---------------- Camera panel ----------------
+            camera_lines = [
+                (
+                    f"SELECTED: {selected_source} {cls_name} | distance {dist:.2f} m",
+                    (0, 90, 255), 0.52, 2,
+                ),
+                (
+                    f"Closing: {closing_speed:+.2f} m/s | TTC: {selected_ttc:.1f} s",
+                    (0, 90, 255), 0.50, 2,
+                ),
+                (
+                    f"GRU: {live_risk:.3f} | RISK: {risk_bucket(live_risk)} | buffer {len(feature_buffer)}/{GRU_SEQ_LEN}",
+                    (0, 90, 255), 0.50, 2,
+                ),
+                (
+                    f"GRU input: d={dist:.2f} m  close={closing_speed:+.2f}  class={cls_name}",
+                    (235, 235, 235), 0.46, 1,
+                ),
+                (
+                    f"Proximity: {proximity_level} | Final: {final_risk:.3f} {final_bucket}",
+                    (0, 90, 255), 0.50, 2,
+                ),
+                (
+                    f"Reason: {proximity_reason} | tracks={len(final_obstacles)}",
+                    (235, 235, 235), 0.46, 1,
+                ),
+                (
+                    f"FPS: {fps:.1f} | Distance mode: {'TRACK-REF' if selected is not None and getattr(selected, 'reference_locked', False) else 'CALIBRATING'}",
+                    (235, 235, 235), 0.46, 1,
+                ),
             ]
 
+            # Unknown status is kept in the camera strip because it is a
+            # navigation-system decision, while the raw mask itself remains
+            # text-free.
+            confirmed = [
+                c for c in unknown_candidates
+                if c.get("stable_confirmed", False)
+            ]
             if confirmed:
                 best_unknown = max(
                     confirmed,
                     key=lambda c: c.get("score", 0.0),
                 )
-
-                unknown_text = (
-                    "UNKNOWN OBSTACLE: "
-                    f"{best_unknown['zone']} "
-                    f"{best_unknown.get('stable_hits', 0)}/"
-                    f"{STABILITY_HITS_REQUIRED} "
-                    f"[{unknown_level}]"
+                unknown_summary = (
+                    f"Unknown obstacle: {best_unknown['zone']} "
+                    f"{best_unknown.get('stable_hits', 0)}/{STABILITY_HITS_REQUIRED} "
+                    f"| risk {unknown_level}"
                 )
             elif unknown_candidates:
                 best_unknown = unknown_candidates[0]
-
-                unknown_text = (
-                    "UNKNOWN CANDIDATE: "
-                    f"{best_unknown['zone']} "
-                    f"{best_unknown.get('stable_hits', 0)}/"
-                    f"{STABILITY_HITS_REQUIRED}"
+                unknown_summary = (
+                    f"Unknown candidate: {best_unknown['zone']} "
+                    f"{best_unknown.get('stable_hits', 0)}/{STABILITY_HITS_REQUIRED}"
                 )
             else:
-                unknown_text = (
-                    "UNKNOWN OBSTACLE: none"
+                unknown_summary = "Unknown obstacle: none"
+
+            camera_lines.append(
+                (unknown_summary, (0, 255, 255), 0.46, 1)
+            )
+
+            # ---------------- MiDaS panel ----------------
+            metric_status = (
+                f"Metric status: CALIBRATED ({len(midas_calibrator.samples)} samples)"
+                if midas_calibrator.ready
+                else f"Metric status: UNCALIBRATED ({len(midas_calibrator.samples)}/3 samples)"
+            )
+            yolo_anchor_text = (
+                f"YOLO anchor: {yolo_anchor_dist:.2f} m | final: {dist:.2f} m"
+                if selected is not None
+                else "YOLO anchor: -- | final: --"
+            )
+            midas_corr = (
+                float(getattr(selected, "last_midas_correction", 1.0))
+                if selected is not None else 1.0
+            )
+            midas_lines = [
+                ("MiDaS Small - RELATIVE DEPTH", (255, 255, 255), 0.58, 2),
+                (metric_status, (0, 255, 255), 0.46, 1),
+                (yolo_anchor_text, (255, 255, 0), 0.46, 1),
+                (f"MiDaS correction factor: {midas_corr:.2f}", (255, 255, 0), 0.46, 1),
+                ("Depth values are used as relative correction evidence.", (235, 235, 235), 0.44, 1),
+                ("Final bbox geometry: fused physical obstacles only.", (235, 235, 235), 0.44, 1),
+            ]
+
+            # ---------------- Mask panel ----------------
+            mask_lines = [
+                ("DEPTH PROTRUSION MASK", (255, 255, 255), 0.58, 2),
+                (f"Confirmed candidates: {len(confirmed)}", (0, 255, 255), 0.46, 1),
+                (f"Raw candidates: {len(raw_unknown_candidates)}", (235, 235, 235), 0.46, 1),
+                (f"Stable requirement: {STABILITY_HITS_REQUIRED}/{STABILITY_WINDOW} frames", (235, 235, 235), 0.46, 1),
+                ("White regions = MiDaS protrusion evidence.", (235, 235, 235), 0.44, 1),
+                ("Only confirmed candidates enter navigation fusion.", (235, 235, 235), 0.44, 1),
+            ]
+
+            # Draw only bounding boxes on the image itself.
+            for tr in final_obstacles:
+                if tr.box is None:
+                    continue
+                is_unknown = getattr(tr, "source", "YOLO") == "MiDaS"
+                color = (
+                    (0, 0, 255) if tr is selected
+                    else ((0, 255, 255) if is_unknown else (150, 150, 150))
+                )
+                cv2.rectangle(
+                    frame,
+                    tr.box[:2],
+                    tr.box[2:],
+                    color,
+                    3,
                 )
 
-            cv2.putText(
-                frame,
-                unknown_text,
-                (10, 159),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (0, 255, 255),
-                2,
-            )
+            if SHOW_ALL_DETECTIONS:
+                for cls_name_raw, box_px, confidence in all_boxes:
+                    cv2.rectangle(
+                        frame,
+                        box_px[:2],
+                        box_px[2:],
+                        (80, 80, 80),
+                        1,
+                    )
 
-            cv2.putText(
-                frame,
-                (
-                    f"UNKNOWN RISK: {unknown_level} | "
-                    f"{unknown_zone} | FINAL: {final_bucket}"
-                ),
-                (10, 184),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.44,
-                (0, 255, 255),
-                1,
-            )
-
-            distance_mode = "TRACK-REF" if selected is not None and getattr(selected, "reference_locked", False) else "CALIBRATING"
-
-            cv2.putText(
-                frame,
-                f"DIST MODE: {distance_mode}",
-                (10, 184),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (0, 0, 255),
-                1,
-            )
-
-            cv2.putText(
-                frame,
-                f"FPS: {fps:.1f}",
-                (10, 208),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (0, 0, 255),
-                1,
-            )
-
-            metric_status = (
-                f"MiDaS metric: CALIBRATED ({len(midas_calibrator.samples)})"
-                if midas_calibrator.ready
-                else f"MiDaS metric: UNCALIBRATED ({len(midas_calibrator.samples)}/3)"
-            )
-
-            cv2.putText(
-                frame,
-                metric_status,
-                (10, 231),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.46,
-                (0, 255, 255),
-                1,
-            )
-
-            # ---------------------------------------------------------
-            # MiDaS panel — persistent after first depth result
-            # ---------------------------------------------------------
+            # Build depth image and mask image without text overlays.
             if have_depth_result and latest_midas_depth is not None:
                 try:
                     depth_vis = midas_visual(
@@ -2879,99 +2841,74 @@ def main():
                         h,
                     )
 
-                    # Only draw the FINAL fused physical obstacles. Raw
-                    # MiDaS candidates are intentionally not drawn because a
-                    # single object may have several mask fragments.
+                    # Same final physical obstacles, no labels.
                     for tr in final_obstacles:
                         if tr.box is None:
                             continue
+                        is_unknown = getattr(tr, "source", "YOLO") == "MiDaS"
+                        color = (
+                            (0, 0, 255) if tr is selected
+                            else ((0, 255, 255) if is_unknown else (150, 150, 150))
+                        )
                         x1, y1, x2, y2 = map(int, tr.box)
                         cv2.rectangle(
                             depth_vis,
-                            (x1, y1),
-                            (x2, y2),
-                            (0, 255, 255),
-                            3,
+                            (x1, y1), (x2, y2),
+                            color, 3,
                         )
 
-                    cv2.putText(
-                        depth_vis,
-                        "MiDaS Small - RELATIVE DEPTH",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.60,
-                        (255, 255, 255),
-                        2,
-                    )
-
-                    if (
-                        latest_unknown_mask is not None
-                        and latest_unknown_mask.size > 0
-                    ):
+                    if latest_unknown_mask is not None and latest_unknown_mask.size > 0:
                         mask_vis = cv2.cvtColor(
                             latest_unknown_mask,
                             cv2.COLOR_GRAY2BGR,
                         )
-
-                        contours, _ = cv2.findContours(
-                            latest_unknown_mask,
-                            cv2.RETR_EXTERNAL,
-                            cv2.CHAIN_APPROX_SIMPLE,
-                        )
-
-                        cv2.drawContours(
-                            mask_vis,
-                            contours,
-                            -1,
-                            (255, 255, 255),
-                            2,
-                        )
-
-                        cv2.putText(
-                            mask_vis,
-                            "DEPTH PROTRUSION MASK",
-                            (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.60,
-                            (255, 255, 255),
-                            2,
-                        )
-
-                        depth_panel = np.hstack(
-                            (
-                                depth_vis,
-                                mask_vis,
-                            )
-                        )
                     else:
-                        depth_panel = depth_vis
-
-                    combined = np.hstack(
-                        (
-                            frame,
-                            depth_panel,
+                        mask_vis = np.zeros(
+                            (h, w, 3),
+                            dtype=np.uint8,
                         )
-                    )
-
-                    safe_imshow(
-                        "wearable-nav + LIVE GRU + MiDaS",
-                        combined,
-                    )
 
                 except Exception as exc:
-                    print(
-                        f"MiDaS display warning: {exc}"
-                    )
-
-                    safe_imshow(
-                        "wearable-nav + LIVE GRU + MiDaS",
-                        frame,
-                    )
+                    print(f"MiDaS display warning: {exc}")
+                    depth_vis = np.zeros_like(frame)
+                    mask_vis = np.zeros_like(frame)
             else:
-                safe_imshow(
-                    "wearable-nav + LIVE GRU + MiDaS",
-                    frame,
+                depth_vis = np.zeros_like(frame)
+                mask_vis = np.zeros_like(frame)
+
+            status_h = 215
+            camera_status = _draw_status_panel(
+                w, status_h, camera_lines,
+                bg=(22, 22, 22),
+                fg=(235, 235, 235),
+            )
+            midas_status = _draw_status_panel(
+                w, status_h, midas_lines,
+                bg=(22, 22, 22),
+                fg=(235, 235, 235),
+            )
+            mask_status = _draw_status_panel(
+                w, status_h, mask_lines,
+                bg=(22, 22, 22),
+                fg=(235, 235, 235),
+            )
+
+            camera_panel = np.vstack((frame, camera_status))
+            midas_panel = np.vstack((depth_vis, midas_status))
+            mask_panel = np.vstack((mask_vis, mask_status))
+
+            combined = np.hstack(
+                (
+                    camera_panel,
+                    midas_panel,
+                    mask_panel,
                 )
+            )
+
+            safe_imshow(
+                "wearable-nav + LIVE GRU + MiDaS",
+                combined,
+            )
 
             key = cv2.waitKey(1) & 0xFF
 
