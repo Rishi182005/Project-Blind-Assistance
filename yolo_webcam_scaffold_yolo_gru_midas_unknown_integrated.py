@@ -71,7 +71,7 @@ class LatestFrameReader:
         self.cap.release()
 
 # ---- config ----
-SOURCE = "http://192.168.29.115:8080/video"   # phone IP-cam stream; 0 = default webcam
+SOURCE = "http://100.81.16.103:8080/video"   # phone IP-cam stream; 0 = default webcam
 MODEL = "yolov8n.pt"  # kept for reference/documentation
 YOLO_OPENVINO_MODEL = "yolov8n_openvino_model/yolov8n.xml"
 YOLO_DEVICE = "GPU"

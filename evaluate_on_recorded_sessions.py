@@ -151,6 +151,30 @@ def evaluate(model, X_test, y_test):
     print(f"MSE: {mse:.4f}")
     print(f"Overall bucketed accuracy: {overall_accuracy:.2f}%")
 
+    # Standard classification metrics from LOW / MEDIUM / HIGH buckets.
+    precisions, recalls, f1_scores = [], [], []
+    print("\nClassification metrics:")
+    print(f"{'':>12s}{'Precision':>12s}{'Recall':>12s}{'F1-score':>12s}")
+
+    for b, name in enumerate(bucket_names):
+        tp = int(((true_buckets == b) & (pred_buckets == b)).sum())
+        fp = int(((true_buckets != b) & (pred_buckets == b)).sum())
+        fn = int(((true_buckets == b) & (pred_buckets != b)).sum())
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        precisions.append(precision); recalls.append(recall); f1_scores.append(f1)
+        print(f"{name:>12s}{precision*100:>11.2f}%{recall*100:>11.2f}%{f1*100:>11.2f}%")
+
+    macro_precision = float(np.mean(precisions))
+    macro_recall = float(np.mean(recalls))
+    macro_f1 = float(np.mean(f1_scores))
+    balanced_accuracy = macro_recall
+    print(f"\nMacro precision:   {macro_precision*100:.2f}%")
+    print(f"Macro recall:      {macro_recall*100:.2f}%")
+    print(f"Macro F1:          {macro_f1*100:.2f}%")
+    print(f"Balanced accuracy: {balanced_accuracy*100:.2f}%")
+
     for name in bucket_names:
         value = per_bucket[name]
         if value is None:
