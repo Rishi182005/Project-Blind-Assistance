@@ -30,7 +30,208 @@ import cv2
 from tensorflow import keras
 import openvino as ov
 from pathlib import Path
+import socket
 
+class UltrasonicReceiver:
+    """Receives HC-SR04 distance packets from the ESP32 over UDP."""
+
+    def __init__(self, host="0.0.0.0", port=4210):
+        self.port = int(port)
+        self.latest_distance_cm = None
+        self.last_received_time = 0.0
+        self.history = deque(maxlen=8)
+        self.raw_history = deque(maxlen=ULTRASONIC_MEDIAN_WINDOW)
+        self.filtered_distance_cm = None
+
+        # State for rejecting sudden jumps to a farther background surface.
+        self.far_jump_candidate_cm = None
+        self.far_jump_start_time = None
+
+        self.lock = threading.Lock()
+        self.running = True
+
+        self.sock = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_DGRAM
+        )
+        self.sock.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_REUSEADDR,
+            1
+        )
+        self.sock.bind((host, self.port))
+        self.sock.settimeout(0.2)
+
+        self.thread = threading.Thread(
+            target=self._receive_loop,
+            name="UltrasonicReceiver",
+            daemon=True
+        )
+        self.thread.start()
+
+        print(f"Ultrasonic UDP receiver listening on port {self.port}")
+
+    def _receive_loop(self):
+        while self.running:
+            try:
+                data, _ = self.sock.recvfrom(1024)
+
+            except socket.timeout:
+                continue
+
+            except OSError:
+                break
+
+            try:
+                text = data.decode("utf-8").strip()
+
+                # ESP32 sends:
+                # distance_cm:123.4,ts:123456
+                parts = {}
+
+                for item in text.split(","):
+                    if ":" in item:
+                        key, value = item.split(":", 1)
+                        parts[key] = value
+
+                distance_cm = float(parts["distance_cm"])
+
+                # Ignore invalid/impossible HC-SR04 packets. In particular,
+                # readings beyond the configured 4 m range must not appear in
+                # the UI or become navigation obstacles.
+                if (
+                    ULTRASONIC_MIN_CM <= distance_cm <= ULTRASONIC_MAX_CM
+                ):
+                    with self.lock:
+                        now = time.monotonic()
+
+                        # Robust filtering:
+                        # 1) Median of the latest 5 readings removes isolated spikes.
+                        # 2) A sudden FAR jump is held temporarily because the
+                        #    sensor may have lost the target and hit the background.
+                        # 3) A closer reading is accepted immediately for safety.
+                        # 4) EMA smooths ordinary frame-to-frame fluctuations.
+                        self.raw_history.append(distance_cm)
+                        median_cm = float(
+                            np.median(
+                                np.asarray(self.raw_history, dtype=np.float32)
+                            )
+                        )
+
+                        if self.filtered_distance_cm is None:
+                            self.filtered_distance_cm = median_cm
+                            self.far_jump_candidate_cm = None
+                            self.far_jump_start_time = None
+                        else:
+                            current_cm = float(self.filtered_distance_cm)
+                            jump_cm = median_cm - current_cm
+
+                            if jump_cm > ULTRASONIC_FAR_JUMP_CM:
+                                if self.far_jump_candidate_cm is None:
+                                    self.far_jump_candidate_cm = median_cm
+                                    self.far_jump_start_time = now
+                                else:
+                                    self.far_jump_candidate_cm = (
+                                        0.5 * self.far_jump_candidate_cm
+                                        + 0.5 * median_cm
+                                    )
+
+                                candidate_age = (
+                                    now - self.far_jump_start_time
+                                    if self.far_jump_start_time is not None
+                                    else 0.0
+                                )
+                                candidate_stability = abs(
+                                    median_cm - self.far_jump_candidate_cm
+                                )
+
+                                if (
+                                    candidate_age >= ULTRASONIC_FAR_JUMP_CONFIRM_S
+                                    and candidate_stability
+                                    <= ULTRASONIC_FAR_JUMP_STABILITY_CM
+                                ):
+                                    self.filtered_distance_cm = (
+                                        ULTRASONIC_EMA_ALPHA * median_cm
+                                        + (1.0 - ULTRASONIC_EMA_ALPHA)
+                                        * current_cm
+                                    )
+                                    self.far_jump_candidate_cm = None
+                                    self.far_jump_start_time = None
+                                else:
+                                    self.filtered_distance_cm = current_cm
+                            else:
+                                self.far_jump_candidate_cm = None
+                                self.far_jump_start_time = None
+                                self.filtered_distance_cm = (
+                                    ULTRASONIC_EMA_ALPHA * median_cm
+                                    + (1.0 - ULTRASONIC_EMA_ALPHA)
+                                    * current_cm
+                                )
+
+                        filtered_cm = float(self.filtered_distance_cm)
+
+                        self.latest_distance_cm = filtered_cm
+                        self.last_received_time = now
+                        self.history.append((now, filtered_cm))
+
+            except (
+                UnicodeDecodeError,
+                ValueError,
+                KeyError
+            ):
+                continue
+
+    def get_latest(self, max_age_s=0.5):
+        """Return the newest distance in cm, or None if it is stale."""
+
+        with self.lock:
+            distance_cm = self.latest_distance_cm
+            received_time = self.last_received_time
+
+        if distance_cm is None:
+            return None
+
+        if time.monotonic() - received_time > max_age_s:
+            return None
+
+        return float(distance_cm)
+
+    def get_latest_with_speed(self, max_age_s=0.5):
+        """Return (distance_cm, closing_speed_mps) from recent HC-SR04 samples."""
+        with self.lock:
+            distance_cm = self.latest_distance_cm
+            received_time = self.last_received_time
+            samples = list(self.history)
+
+        if distance_cm is None:
+            return None, 0.0
+        if time.monotonic() - received_time > max_age_s:
+            return None, 0.0
+
+        # Use a short baseline so the ultrasonic derivative is less sensitive
+        # to individual noisy pings. Positive = obstacle getting closer.
+        if len(samples) >= 2:
+            t0, d0 = samples[0]
+            t1, d1 = samples[-1]
+            dt = max(t1 - t0, 1e-3)
+            closing_speed = (d0 - d1) / 100.0 / dt
+            if abs(closing_speed) < SPEED_DEADBAND:
+                closing_speed = 0.0
+        else:
+            closing_speed = 0.0
+
+        return float(distance_cm), float(closing_speed)
+
+    def stop(self):
+        self.running = False
+
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+        if self.thread.is_alive():
+            self.thread.join(timeout=1.0)
 
 class LatestFrameReader:
     """Reads frames from a VideoCapture in a background thread, always
@@ -71,11 +272,15 @@ class LatestFrameReader:
         self.cap.release()
 
 # ---- config ----
-SOURCE = "http://100.81.16.103:8080/video"   # phone IP-cam stream; 0 = default webcam
+SOURCE = "http://192.168.29.115:8080/video"   # phone IP-cam stream; 0 = default webcam
 MODEL = "yolov8n.pt"  # kept for reference/documentation
 YOLO_OPENVINO_MODEL = "yolov8n_openvino_model/yolov8n.xml"
 YOLO_DEVICE = "GPU"
 YOLO_INPUT_SIZE = 256
+
+# Run YOLO every 2nd frame to reduce inference load.
+# Tracking keeps the latest detected objects between YOLO passes.
+YOLO_INFERENCE_EVERY_N_FRAMES = 2
 
 # Match the confidence/NMS style of a normal YOLO detection pipeline.
 YOLO_CONF_THRESHOLD = 0.25
@@ -145,7 +350,7 @@ GRU_INFERENCE_EVERY_N_FRAMES = 3
 MIDAS_MODEL_FILE = "MiDaS/weights/openvino/openvino_midas_v21_small_256.xml"
 MIDAS_DEVICE = "GPU"
 MIDAS_INPUT_SIZE = 256
-MIDAS_INFERENCE_EVERY_N_FRAMES = 1       # Async; main loop never waits for it.
+MIDAS_INFERENCE_EVERY_N_FRAMES = 2       # Async; main loop never waits for it.
 
 # ---- immediate proximity safety layer ----
 # These are deliberately NOT fed back into the GRU. The GRU remains the
@@ -213,6 +418,45 @@ SPEED_WINDOW = 8                 # frames of history kept per tracked object
 #
 # The fused value is then aggregated over a short temporal window before
 # closing speed/TTC are calculated.
+# ---- HC-SR04 metric-distance fusion ----
+# The ultrasonic sensor is used as the authoritative metric distance only
+# for a YOLO obstacle whose image position is close to the sensor's forward
+# axis. YOLO still supplies semantic identity and bounding-box position.
+ULTRASONIC_FUSION_ENABLED = True
+ULTRASONIC_MAX_AGE_S = 0.5
+ULTRASONIC_CENTER_TOL_FRAC = 0.15
+ULTRASONIC_MIN_CM = 2.0
+ULTRASONIC_MAX_CM = 400.0
+ULTRASONIC_MEDIAN_WINDOW = 5
+ULTRASONIC_EMA_ALPHA = 0.25
+
+# Reject sudden jumps to a much FARTHER reading (often the background wall).
+# A closer reading is accepted immediately for safety. A farther reading is
+# accepted only after it remains stable for this many seconds.
+ULTRASONIC_FAR_JUMP_CM = 35.0
+ULTRASONIC_FAR_JUMP_CONFIRM_S = 1.0
+ULTRASONIC_FAR_JUMP_STABILITY_CM = 12.0
+
+# ---- long-range vision-assisted ultrasonic failsafe ----
+ULTRASONIC_VISION_OVERRIDE_START_M = 3.20
+ULTRASONIC_VISION_OVERRIDE_MARGIN_M = 0.20
+ULTRASONIC_VISION_CONFIRM_S = 1.00
+ULTRASONIC_VISION_MIN_UPDATES = 3
+ULTRASONIC_VISION_CENTER_TOL_FRAC = 0.20
+
+# Conservative vision confidence gate for the long-range ultrasonic failsafe.
+# The absolute YOLO calibration was obtained primarily from person-distance
+# data, so other classes are allowed but receive a small reliability penalty.
+VISION_CONF_HIGH = 0.68
+VISION_CONF_MEDIUM = 0.45
+VISION_MIN_YOLO_CONF = 0.30
+VISION_HIGH_YOLO_CONF = 0.50
+VISION_MIN_MIDAS_STRENGTH = 0.12
+VISION_HIGH_MIDAS_STRENGTH = 0.35
+VISION_STABILITY_CV_HIGH = 0.10
+VISION_STABILITY_CV_MEDIUM = 0.20
+VISION_NON_PERSON_PENALTY = 0.88
+
 DIST_FUSION_ENABLED = True
 MIDAS_CORRECTION_GAMMA = 0.65
 MIDAS_CORRECTION_MIN = 0.70
@@ -254,7 +498,7 @@ MATCH_MAX_DIST_FRAC = 0.25       # max centroid movement (as a fraction of frame
                                   # width) between frames to count as "the same
                                   # object" -- tune up if fast objects lose their
                                   # track ID, down if separate objects get merged
-TRACK_TIMEOUT_S = 1.0            # drop a track if not matched for this long
+TRACK_TIMEOUT_S = 1.5            # keep a track through short YOLO dropouts
                                   # (object left frame / occluded)
 TTC_SAFE_VALUE = 999.0
 UNKNOWN_REPLACEMENT_MARGIN_M = 0.15           # TTC assigned when an object isn't closing
@@ -507,9 +751,21 @@ class Track:
         self.filtered_closing_speed = 0.0
         self.last_seen = now
         self.last_yolo_distance = float(dist)
+        self.last_yolo_confidence = 0.0
         self.last_midas_ratio = 1.0
         self.last_midas_correction = 1.0
         self.last_midas_strength = 0.0
+
+        # Independent vision-only metric history. The main `history` can be
+        # replaced by HC-SR04, so it must never be reused for the long-range
+        # vision-vs-ultrasonic comparison.
+        self.vision_distance_history = deque(
+            [float(dist)],
+            maxlen=DIST_FUSION_MEDIAN_WINDOW,
+        )
+        self.vision_smoothed_dist = float(dist)
+        self.vision_history = [(now, float(dist))]
+        self.vision_filtered_closing_speed = 0.0
 
     def _update_reference(self, area_frac, calibrated_dist):
         if self.reference_locked:
@@ -602,6 +858,24 @@ class Track:
         fused_dist = float(raw_dist)
         self.last_yolo_distance = fused_dist
 
+        # Maintain a vision-only distance stream independent of HC-SR04.
+        self.vision_distance_history.append(fused_dist)
+        vision_median_dist = float(
+            np.median(
+                np.asarray(
+                    self.vision_distance_history,
+                    dtype=np.float64,
+                )
+            )
+        )
+        self.vision_smoothed_dist = (
+            TRACK_DISTANCE_EMA_ALPHA * vision_median_dist
+            + (1.0 - TRACK_DISTANCE_EMA_ALPHA) * self.vision_smoothed_dist
+        )
+        self.vision_history.append((now, self.vision_smoothed_dist))
+        if len(self.vision_history) > SPEED_WINDOW:
+            self.vision_history.pop(0)
+
         self.distance_history.append(fused_dist)
 
         # Robust temporal aggregation first, then a light EMA.
@@ -641,6 +915,31 @@ class Track:
         if abs(self.filtered_closing_speed) < SPEED_DEADBAND:
             return 0.0
         return self.filtered_closing_speed
+
+    def vision_closing_speed(self):
+        """Closing speed computed only from the independent vision history."""
+        if len(self.vision_history) < 2:
+            return 0.0
+        t0, d0 = self.vision_history[0]
+        t1, d1 = self.vision_history[-1]
+        dt = max(t1 - t0, 1e-3)
+        speed = (d0 - d1) / dt
+        if abs(speed) < SPEED_DEADBAND:
+            speed = 0.0
+        self.vision_filtered_closing_speed = (
+            CLOSING_SPEED_EMA_ALPHA * speed
+            + (1.0 - CLOSING_SPEED_EMA_ALPHA) * self.vision_filtered_closing_speed
+        )
+        if abs(self.vision_filtered_closing_speed) < SPEED_DEADBAND:
+            return 0.0
+        return self.vision_filtered_closing_speed
+
+    def vision_ttc(self):
+        """TTC computed from the independent vision metric stream."""
+        speed = self.vision_closing_speed()
+        if speed <= 0:
+            return TTC_SAFE_VALUE
+        return self.vision_smoothed_dist / speed
 
     def ttc(self):
         """Time-to-collision estimate. Lower = more urgent.
@@ -688,6 +987,89 @@ def match_detections_to_tracks(detections, tracks, frame_width, frame_height, no
     return updated[:MAX_TRACKS]
 
 
+def assign_yolo_confidence_to_tracks(tracks, yolo_detections, frame_width):
+    """Attach raw YOLO confidence to the already-matched Track objects."""
+    if not yolo_detections:
+        return
+    max_dist_px = MATCH_MAX_DIST_FRAC * frame_width
+    for tr in tracks:
+        if tr.box is None:
+            continue
+        best_conf = None
+        best_dist = None
+        for cls_name_raw, centroid, _box, confidence in yolo_detections:
+            mapped = CLASS_MAP.get(cls_name_raw, cls_name_raw)
+            if mapped != tr.cls_name:
+                continue
+            d = np.hypot(
+                centroid[0] - tr.centroid[0],
+                centroid[1] - tr.centroid[1],
+            )
+            if d <= max_dist_px and (best_dist is None or d < best_dist):
+                best_dist = d
+                best_conf = float(confidence)
+        if best_conf is not None:
+            tr.last_yolo_confidence = best_conf
+
+
+def vision_confidence(track):
+    """Return (score, level, details) for the long-range vision failsafe."""
+    if track is None or getattr(track, "box", None) is None:
+        return 0.0, "LOW", "no visual bbox"
+
+    yolo_conf = float(np.clip(getattr(track, "last_yolo_confidence", 0.0), 0.0, 1.0))
+    midas_strength = float(np.clip(getattr(track, "last_midas_strength", 0.0), 0.0, 1.0))
+    hist = np.asarray(list(getattr(track, "vision_distance_history", [])), dtype=np.float64)
+
+    if hist.size >= 3:
+        mean_d = max(float(np.mean(hist)), 1e-6)
+        cv = float(np.std(hist) / mean_d)
+    else:
+        cv = 1.0
+
+    if yolo_conf < VISION_MIN_YOLO_CONF:
+        yolo_score = 0.0
+    elif yolo_conf >= VISION_HIGH_YOLO_CONF:
+        yolo_score = 1.0
+    else:
+        yolo_score = (yolo_conf - VISION_MIN_YOLO_CONF) / max(
+            VISION_HIGH_YOLO_CONF - VISION_MIN_YOLO_CONF, 1e-6
+        )
+
+    if cv <= VISION_STABILITY_CV_HIGH:
+        stability_score = 1.0
+    elif cv <= VISION_STABILITY_CV_MEDIUM:
+        stability_score = (VISION_STABILITY_CV_MEDIUM - cv) / max(
+            VISION_STABILITY_CV_MEDIUM - VISION_STABILITY_CV_HIGH, 1e-6
+        )
+    else:
+        stability_score = 0.0
+
+    if midas_strength <= VISION_MIN_MIDAS_STRENGTH:
+        midas_score = 0.0
+    elif midas_strength >= VISION_HIGH_MIDAS_STRENGTH:
+        midas_score = 1.0
+    else:
+        midas_score = (midas_strength - VISION_MIN_MIDAS_STRENGTH) / max(
+            VISION_HIGH_MIDAS_STRENGTH - VISION_MIN_MIDAS_STRENGTH, 1e-6
+        )
+
+    score = 0.50 * yolo_score + 0.25 * stability_score + 0.25 * midas_score
+    if getattr(track, "cls_name", "") != "person":
+        score *= VISION_NON_PERSON_PENALTY
+    score = float(np.clip(score, 0.0, 1.0))
+
+    if score >= VISION_CONF_HIGH:
+        level = "HIGH"
+    elif score >= VISION_CONF_MEDIUM:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+
+    details = f"conf={yolo_conf:.2f} cv={cv:.2f} MiDaS={midas_strength:.2f} score={score:.2f}"
+    return score, level, details
+
+
 def current_yolo_anchor_distance(track, frame_area):
     """Recover the original calibrated YOLO bbox-area estimate for diagnostics."""
     if track is None or track.box is None:
@@ -712,7 +1094,7 @@ def risk_bucket(risk):
 
 
 
-def proximity_override(tr, frame_height):
+def proximity_override(tr, frame_height, distance_override=None):
     """
     Deterministic immediate-proximity check.
 
@@ -728,7 +1110,11 @@ def proximity_override(tr, frame_height):
 
     x1, y1, x2, y2 = tr.box
     bottom_frac = float(y2) / max(frame_height, 1)
-    dist = float(tr.smoothed_dist)
+    dist = (
+        float(distance_override)
+        if distance_override is not None
+        else float(tr.smoothed_dist)
+    )
 
     if dist <= PROXIMITY_CRITICAL_M:
         return "CRITICAL", f"distance {dist:.2f}m"
@@ -1852,6 +2238,7 @@ def main():
     midas_calibrator = MidasMetricCalibrator()
 
     reader = LatestFrameReader(SOURCE)
+    ultrasonic = UltrasonicReceiver(host="0.0.0.0", port=4210)
 
     try:
         reader.cap.set(
@@ -1864,11 +2251,30 @@ def main():
     tracks = []
     feature_buffer = deque(maxlen=GRU_SEQ_LEN)
 
+    # Keep the most recent YOLO results available on frames where YOLO is
+    # intentionally skipped. This prevents detections/all_boxes from becoming
+    # undefined when YOLO runs only every Nth frame.
+    detections = []
+    all_boxes = []
+    yolo_detections = []
+
+    # Persistent fallback obstacle used when HC-SR04 has a valid reading but
+    # neither YOLO nor MiDaS provides a corresponding object.
+    ultrasonic_virtual_track = None
+
+    # Long-range vision-assisted ultrasonic override state.
+    ultrasonic_vision_candidate_key = None
+    ultrasonic_vision_candidate_start = None
+    ultrasonic_vision_candidate_updates = 0
+    ultrasonic_vision_override_active = False
+    ultrasonic_vision_override_track = None
+
     live_risk = GRU_WARMUP_RISK
     live_risk_target = GRU_WARMUP_RISK
 
     frame_counter = 0
     midas_counter = 0
+    pipeline_frame_counter = 0
 
     latest_midas_depth = None
     latest_midas_raw_depth = None
@@ -1896,6 +2302,17 @@ def main():
     print("MiDaS bbox: native-grid protrusion geometry + balanced fragment merge.")
     print("YOLO labels: full semantic classes preserved; 6-class mapping only at GRU input.")
     print("MiDaS processing: native-grid analysis; full-resolution upscale only for display.")
+    print(
+        "Long-range failsafe: HC-SR04 <= "
+        f"{ULTRASONIC_VISION_OVERRIDE_START_M:.2f}m authoritative; "
+        "stable HIGH-confidence forward vision may override beyond this."
+    )
+    print(
+        "Vision confidence: HIGH required; "
+        f"margin={ULTRASONIC_VISION_OVERRIDE_MARGIN_M:.2f}m, "
+        f"confirmation={ULTRASONIC_VISION_CONFIRM_S:.1f}s/"
+        f"{ULTRASONIC_VISION_MIN_UPDATES} updates."
+    )
     print("Press 'q' to quit.")
 
     try:
@@ -1935,6 +2352,7 @@ def main():
                 continue
 
             h, w = frame.shape[:2]
+            pipeline_frame_counter += 1
 
             # ---------------------------------------------------------
             # Loop FPS
@@ -2022,114 +2440,135 @@ def main():
             # ---------------------------------------------------------
             # YOLO
             # ---------------------------------------------------------
-            yolo_detections = infer_yolo_openvino(
-                yolo_model,
-                yolo_output,
-                frame,
+            # The tracker needs a current timestamp on EVERY frame,
+            # including frames where YOLO inference is skipped.
+            now = time.time()
+
+            # Run YOLO every N frames. On skipped frames, reuse the most
+            # recent detections instead of performing another GPU inference.
+            fresh_yolo = (
+                pipeline_frame_counter % YOLO_INFERENCE_EVERY_N_FRAMES == 0
             )
 
-            now = time.time()
-            detections = []
-            all_boxes = []
+            if fresh_yolo:
+                yolo_detections = infer_yolo_openvino(
+                    yolo_model,
+                    yolo_output,
+                    frame,
+                )
 
-            for (
-                cls_name_raw,
-                centroid,
-                box_px,
-                confidence,
-            ) in yolo_detections:
-                all_boxes.append(
-                    (
+                detections = []
+                all_boxes = []
+
+                for (
+                    cls_name_raw,
+                    centroid,
+                    box_px,
+                    confidence,
+                ) in yolo_detections:
+                    all_boxes.append(
+                        (
+                            cls_name_raw,
+                            box_px,
+                            confidence,
+                        )
+                    )
+
+                    mapped = CLASS_MAP.get(
                         cls_name_raw,
-                        box_px,
-                        confidence,
+                        cls_name_raw,
                     )
-                )
 
-                mapped = CLASS_MAP.get(
-                    cls_name_raw,
-                    cls_name_raw,
-                )
+                    x1, y1, x2, y2 = box_px
 
-                x1, y1, x2, y2 = box_px
-
-                area_frac = (
-                    (
-                        (x2 - x1)
-                        * (y2 - y1)
+                    area_frac = (
+                        (
+                            (x2 - x1)
+                            * (y2 - y1)
+                        )
+                        / max(
+                            w * h,
+                            1,
+                        )
                     )
-                    / max(
-                        w * h,
-                        1,
+
+                    yolo_dist = bbox_area_to_distance(
+                        area_frac
                     )
-                )
 
-                yolo_dist = bbox_area_to_distance(
-                    area_frac
-                )
-
-                # Fuse the calibrated YOLO metric anchor with local MiDaS
-                # depth evidence. MiDaS is never interpreted as metres here.
-                fused_dist = yolo_dist
-                midas_corr = 1.0
-                midas_ratio = 1.0
-                midas_strength = 0.0
-
-                if (
-                    DIST_FUSION_ENABLED
-                    and latest_midas_raw_depth is not None
-                ):
-                    (
-                        midas_corr,
-                        obj_depth,
-                        bg_depth,
-                        midas_strength,
-                    ) = midas_relative_correction(
-                        latest_midas_raw_depth,
-                        box_px,
-                        frame.shape,
-                    )
+                    # Fuse the calibrated YOLO metric anchor with local MiDaS
+                    # depth evidence. MiDaS is never interpreted as metres here.
+                    fused_dist = yolo_dist
+                    midas_corr = 1.0
+                    midas_ratio = 1.0
+                    midas_strength = 0.0
 
                     if (
-                        np.isfinite(obj_depth)
-                        and np.isfinite(bg_depth)
-                        and bg_depth > 1e-6
+                        DIST_FUSION_ENABLED
+                        and latest_midas_raw_depth is not None
                     ):
-                        midas_ratio = float(
-                            np.clip(
-                                obj_depth / bg_depth,
-                                MIDAS_RATIO_MIN,
-                                MIDAS_RATIO_MAX,
+                        (
+                            midas_corr,
+                            obj_depth,
+                            bg_depth,
+                            midas_strength,
+                        ) = midas_relative_correction(
+                            latest_midas_raw_depth,
+                            box_px,
+                            frame.shape,
+                        )
+
+                        if (
+                            np.isfinite(obj_depth)
+                            and np.isfinite(bg_depth)
+                            and bg_depth > 1e-6
+                        ):
+                            midas_ratio = float(
+                                np.clip(
+                                    obj_depth / bg_depth,
+                                    MIDAS_RATIO_MIN,
+                                    MIDAS_RATIO_MAX,
+                                )
                             )
-                        )
 
-                        # Trust the correction only in proportion to local
-                        # depth evidence; weak/ambiguous MiDaS contrast stays
-                        # close to the original YOLO metric estimate.
-                        effective_corr = (
-                            1.0
-                            + (
-                                midas_corr - 1.0
-                            ) * midas_strength
-                        )
-
-                        fused_dist = float(
-                            np.clip(
-                                yolo_dist * effective_corr,
-                                0.2,
-                                MAX_RANGE,
+                            effective_corr = (
+                                1.0
+                                + (
+                                    midas_corr - 1.0
+                                ) * midas_strength
                             )
-                        )
 
-                detections.append(
-                    (
-                        mapped,
-                        centroid,
-                        box_px,
-                        fused_dist,
+                            fused_dist = float(
+                                np.clip(
+                                    yolo_dist * effective_corr,
+                                    0.2,
+                                    MAX_RANGE,
+                                )
+                            )
+
+                    detections.append(
+                        (
+                            mapped,
+                            centroid,
+                            box_px,
+                            fused_dist,
+                        )
                     )
-                )
 
+                # Update the tracker only when YOLO has produced fresh boxes.
+                tracks = match_detections_to_tracks(
+                    detections,
+                    tracks,
+                    w,
+                    h,
+                    now,
+                )
+                assign_yolo_confidence_to_tracks(
+                    tracks,
+                    yolo_detections,
+                    w,
+                )
+            
             # ---------------------------------------------------------
             # PRIORITY FUSION / TOP-3 POLICY
             # ---------------------------------------------------------
@@ -2419,13 +2858,253 @@ def main():
 
 
             # ---------------------------------------------------------
-            # Unified obstacle selection from the FINAL top-3 set.
-            # Selection for the GRU is based on TTC, while display priority
-            # remains the nearest-three policy above.
+            # HC-SR04 PRIORITY / METRIC OVERRIDE
             # ---------------------------------------------------------
+            # Policy:
+            #   1. A fresh valid HC-SR04 reading has priority.
+            #   2. If a YOLO object is close to the sensor's forward image axis,
+            #      keep its semantic identity/bounding box and replace its
+            #      metric distance with HC-SR04.
+            #   3. If YOLO/MiDaS do NOT provide a matching object, create a
+            #      virtual "HC-SR04 obstacle" so the ultrasonic detection is
+            #      still selected and sent to the GRU.
+            #
+            # This makes the ultrasonic sensor an independent safety channel.
+            # IMPORTANT: one HC-SR04 cannot identify what it hit. If its beam
+            # misses a small object, it can legitimately measure the wall behind
+            # it; software cannot distinguish those two cases from one reading.
+            # ---------------------------------------------------------
+            ultrasonic_distance_cm, ultrasonic_closing_speed = (
+                ultrasonic.get_latest_with_speed(
+                    max_age_s=ULTRASONIC_MAX_AGE_S
+                )
+                if ULTRASONIC_FUSION_ENABLED
+                else (None, 0.0)
+            )
+
+            ultrasonic_track = None
+
+            if ultrasonic_distance_cm is not None:
+                frame_center_x = w / 2.0
+                center_limit = w * ULTRASONIC_CENTER_TOL_FRAC
+                center_candidates = []
+
+                for tr in final_obstacles:
+                    if tr.box is None:
+                        continue
+                    x1, _, x2, _ = tr.box
+                    box_center_x = (x1 + x2) / 2.0
+                    center_error = abs(box_center_x - frame_center_x)
+                    if center_error <= center_limit:
+                        center_candidates.append((center_error, tr))
+
+                # Prefer the closest-to-axis YOLO object for semantic identity.
+                if center_candidates:
+                    _, ultrasonic_track = min(
+                        center_candidates,
+                        key=lambda item: item[0]
+                    )
+                else:
+                    # No YOLO/MiDaS object corresponds to the forward ultrasonic
+                    # return. Keep the sensor reading as an independent obstacle.
+                    if ultrasonic_virtual_track is None:
+                        ultrasonic_virtual_track = Track(
+                            "ultrasonic obstacle",
+                            (frame_center_x, h * 0.70),
+                            ultrasonic_distance_cm / 100.0,
+                            now,
+                            box=None,
+                            frame_area=w * h,
+                        )
+                    ultrasonic_track = ultrasonic_virtual_track
+                    ultrasonic_track.cls_name = "ultrasonic obstacle"
+                    ultrasonic_track.source = "HC-SR04"
+                    ultrasonic_track.centroid = (frame_center_x, h * 0.70)
+                    ultrasonic_track.last_seen = now
+                    ultrasonic_track.box = None
+
+                ultrasonic_m = float(
+                    np.clip(
+                        ultrasonic_distance_cm / 100.0,
+                        0.02,
+                        MAX_RANGE,
+                    )
+                )
+
+                # Switch the selected track to authoritative ultrasonic metric
+                # history. This prevents bad YOLO distance estimates from
+                # contaminating the GRU when the ultrasonic channel is active.
+                if not getattr(
+                    ultrasonic_track,
+                    "ultrasonic_active",
+                    False,
+                ):
+                    ultrasonic_track.history = []
+                    ultrasonic_track.distance_history.clear()
+                    ultrasonic_track.filtered_closing_speed = 0.0
+                    ultrasonic_track.ultrasonic_active = True
+
+                ultrasonic_track.smoothed_dist = ultrasonic_m
+                ultrasonic_track.distance_history.append(ultrasonic_m)
+                ultrasonic_track.history.append(
+                    (now, ultrasonic_m)
+                )
+                if len(ultrasonic_track.history) > SPEED_WINDOW:
+                    ultrasonic_track.history.pop(0)
+                ultrasonic_track.filtered_closing_speed = ultrasonic_closing_speed
+
+                # The virtual track has no semantic class; when a YOLO object
+                # exists, retain its real class name for display/GRU mapping.
+                if ultrasonic_track is ultrasonic_virtual_track:
+                    ultrasonic_track.last_yolo_distance = ultrasonic_m
+                    ultrasonic_track.last_midas_ratio = 1.0
+                    ultrasonic_track.last_midas_correction = 1.0
+                    ultrasonic_track.last_midas_strength = 0.0
+
+
+            # ---------------------------------------------------------
+            # LONG-RANGE VISION-ASSISTED ULTRASONIC FAILSAFE
+            # ---------------------------------------------------------
+            # HC-SR04 remains authoritative at close/normal range. Beyond the
+            # threshold, a background return is possible. Vision can override
+            # only when a forward-axis obstacle is meaningfully closer, has HIGH
+            # confidence, and remains consistent across fresh updates.
+            # Raw MiDaS depth is NEVER compared directly with metres.
+            # ---------------------------------------------------------
+            vision_override_track = None
+            vision_override_reason = "inactive"
+            vision_override_score = 0.0
+            vision_override_level = "LOW"
+            vision_override_details = "no candidate"
+
+            if ultrasonic_distance_cm is not None:
+                ultrasonic_m = float(ultrasonic_distance_cm / 100.0)
+
+                if ultrasonic_m >= ULTRASONIC_VISION_OVERRIDE_START_M:
+                    center_limit = w * ULTRASONIC_VISION_CENTER_TOL_FRAC
+                    vision_candidates = []
+
+                    for tr in final_obstacles:
+                        if tr.box is None:
+                            continue
+
+                        x1, _, x2, _ = tr.box
+                        box_center_x = (x1 + x2) / 2.0
+                        center_error = abs(box_center_x - (w / 2.0))
+                        if center_error > center_limit:
+                            continue
+
+                        if getattr(tr, "source", "YOLO") == "YOLO":
+                            vision_dist = float(
+                                getattr(tr, "vision_smoothed_dist", tr.last_yolo_distance)
+                            )
+                        else:
+                            vision_dist = float(tr.smoothed_dist)
+
+                        if not np.isfinite(vision_dist):
+                            continue
+
+                        score, level, details = vision_confidence(tr)
+
+                        if (
+                            vision_dist < (ultrasonic_m - ULTRASONIC_VISION_OVERRIDE_MARGIN_M)
+                            and level == "HIGH"
+                        ):
+                            vision_candidates.append(
+                                (vision_dist, center_error, score, level, details, tr)
+                            )
+
+                    if vision_candidates:
+                        _, _, score, level, details, candidate = min(
+                            vision_candidates,
+                            key=lambda item: (item[0], item[1]),
+                        )
+
+                        candidate_key = (
+                            getattr(candidate, "source", "YOLO"),
+                            getattr(candidate, "cls_name", "unknown"),
+                            getattr(candidate, "id", id(candidate)),
+                        )
+                        fresh_vision_update = bool(fresh_yolo or depth_result is not None)
+
+                        if candidate_key != ultrasonic_vision_candidate_key:
+                            ultrasonic_vision_candidate_key = candidate_key
+                            ultrasonic_vision_candidate_start = now
+                            ultrasonic_vision_candidate_updates = (
+                                1 if fresh_vision_update else 0
+                            )
+                            ultrasonic_vision_override_active = False
+                        elif fresh_vision_update:
+                            ultrasonic_vision_candidate_updates += 1
+
+                        candidate_age = (
+                            now - ultrasonic_vision_candidate_start
+                            if ultrasonic_vision_candidate_start is not None
+                            else 0.0
+                        )
+                        vision_override_score = score
+                        vision_override_level = level
+                        vision_override_details = details
+
+                        if (
+                            candidate_age >= ULTRASONIC_VISION_CONFIRM_S
+                            and ultrasonic_vision_candidate_updates >= ULTRASONIC_VISION_MIN_UPDATES
+                        ):
+                            ultrasonic_vision_override_active = True
+                            ultrasonic_vision_override_track = candidate
+                            vision_override_track = candidate
+                            vision_override_reason = (
+                                f"stable vision {candidate.vision_smoothed_dist:.2f}m "
+                                f"< ultrasonic {ultrasonic_m:.2f}m | {level} ({score:.2f})"
+                            )
+                    else:
+                        # No sufficiently trustworthy visual override. Keep
+                        # HC-SR04 authoritative and expose the reason in UI.
+                        ultrasonic_vision_candidate_key = None
+                        ultrasonic_vision_candidate_start = None
+                        ultrasonic_vision_candidate_updates = 0
+                        ultrasonic_vision_override_active = False
+                        ultrasonic_vision_override_track = None
+
+                        diagnostics = []
+                        for tr in final_obstacles:
+                            if tr.box is None:
+                                continue
+                            x1, _, x2, _ = tr.box
+                            if abs(((x1 + x2) / 2.0) - (w / 2.0)) <= center_limit:
+                                _score, _level, _details = vision_confidence(tr)
+                                diagnostics.append((_score, _level, _details))
+                        if diagnostics:
+                            _, vision_override_level, vision_override_details = max(
+                                diagnostics, key=lambda item: item[0]
+                            )
+                else:
+                    ultrasonic_vision_candidate_key = None
+                    ultrasonic_vision_candidate_start = None
+                    ultrasonic_vision_candidate_updates = 0
+                    ultrasonic_vision_override_active = False
+                    ultrasonic_vision_override_track = None
+            else:
+                ultrasonic_vision_candidate_key = None
+                ultrasonic_vision_candidate_start = None
+                ultrasonic_vision_candidate_updates = 0
+                ultrasonic_vision_override_active = False
+                ultrasonic_vision_override_track = None
+
+            # Unified obstacle selection from the FINAL top-3 set.
+            # HC-SR04 remains the default. A confirmed long-range vision
+            # obstacle is the only exception.
             selected = (
-                min(final_obstacles, key=lambda t: t.ttc())
-                if final_obstacles else None
+                vision_override_track
+                if vision_override_track is not None
+                else (
+                    ultrasonic_track
+                    if ultrasonic_track is not None
+                    else (
+                        min(final_obstacles, key=lambda t: t.ttc())
+                        if final_obstacles else None
+                    )
+                )
             )
 
             for tr in final_obstacles:
@@ -2438,9 +3117,15 @@ def main():
                 cv2.rectangle(frame, tr.box[:2], tr.box[2:], color, 3)
 
             if selected is not None:
-
-                dist = selected.smoothed_dist
-                closing_speed = selected.closing_speed()
+                if (
+                    ultrasonic_vision_override_active
+                    and vision_override_track is selected
+                ):
+                    dist = float(selected.vision_smoothed_dist)
+                    closing_speed = float(selected.vision_closing_speed())
+                else:
+                    dist = selected.smoothed_dist
+                    closing_speed = selected.closing_speed()
                 cls_name = selected.cls_name
                 selected_is_unknown = (
                     selected is not None
@@ -2517,6 +3202,7 @@ def main():
                 proximity_override(
                     selected,
                     h,
+                    distance_override=dist,
                 )
             )
 
@@ -2560,8 +3246,17 @@ def main():
             # GRU/proximity path above has ALREADY consumed its distance,
             # closing speed and class proxy. Keep the safety floor as an
             # additional guard, but do not overwrite those measurements.
-            selected_source = "MiDaS UNKNOWN" if selected_is_unknown else (
-                "YOLO" if selected is not None else "NONE"
+            selected_source = (
+                "VISION OVERRIDE"
+                if ultrasonic_vision_override_active
+                and vision_override_track is selected
+                else (
+                    "HC-SR04" if ultrasonic_track is selected
+                    else (
+                        "MiDaS UNKNOWN" if selected_is_unknown
+                        else ("YOLO" if selected is not None else "NONE")
+                    )
+                )
             )
 
             # ---------------------------------------------------------
@@ -2594,8 +3289,15 @@ def main():
             # Keep the displayed obstacle boxes, but put ALL descriptive text
             # below the corresponding image instead of over it.
             if selected is not None:
-                dist = selected.smoothed_dist
-                closing_speed = selected.closing_speed()
+                if (
+                    ultrasonic_vision_override_active
+                    and vision_override_track is selected
+                ):
+                    dist = float(selected.vision_smoothed_dist)
+                    closing_speed = float(selected.vision_closing_speed())
+                else:
+                    dist = selected.smoothed_dist
+                    closing_speed = selected.closing_speed()
                 cls_name = selected.cls_name
                 selected_is_unknown = (
                     getattr(selected, "source", "YOLO") == "MiDaS"
@@ -2607,11 +3309,25 @@ def main():
                 selected_is_unknown = False
 
             selected_source = (
-                "MiDaS UNKNOWN" if selected_is_unknown
-                else ("YOLO" if selected is not None else "NONE")
+                "VISION OVERRIDE"
+                if ultrasonic_vision_override_active
+                and vision_override_track is selected
+                else (
+                    "HC-SR04" if ultrasonic_track is selected
+                    else (
+                        "MiDaS UNKNOWN" if selected_is_unknown
+                        else ("YOLO" if selected is not None else "NONE")
+                    )
+                )
             )
             selected_ttc = (
-                selected.ttc() if selected is not None else TTC_SAFE_VALUE
+                selected.vision_ttc()
+                if (
+                    selected is not None
+                    and ultrasonic_vision_override_active
+                    and vision_override_track is selected
+                )
+                else (selected.ttc() if selected is not None else TTC_SAFE_VALUE)
             )
 
             # ---------------- Camera panel ----------------
@@ -2619,6 +3335,33 @@ def main():
                 (
                     f"SELECTED: {selected_source} {cls_name} | distance {dist:.2f} m",
                     (0, 90, 255), 0.52, 2,
+                ),
+                (
+                    (
+                        f"Ultrasonic: {ultrasonic_distance_cm:.1f} cm (smoothed)"
+                        if ultrasonic_distance_cm is not None
+                        else "Ultrasonic: -- cm (no recent reading)"
+                    ),
+                    (0, 255, 255), 0.50, 2,
+                ),
+                (
+                    (
+                        f"Vision override: ACTIVE | {vision_override_reason}"
+                        if ultrasonic_vision_override_active
+                        else (
+                            f"Vision check: {ultrasonic_vision_candidate_updates}/"
+                            f"{ULTRASONIC_VISION_MIN_UPDATES} updates"
+                            if ultrasonic_distance_cm is not None
+                            and ultrasonic_distance_cm / 100.0
+                            >= ULTRASONIC_VISION_OVERRIDE_START_M
+                            else "Vision override: inactive (HC-SR04 authoritative)"
+                        )
+                    ),
+                    (255, 255, 0), 0.44, 1,
+                ),
+                (
+                    f"Vision confidence: {vision_override_level} | {vision_override_details}",
+                    (255, 255, 0), 0.44, 1,
                 ),
                 (
                     f"Closing: {closing_speed:+.2f} m/s | TTC: {selected_ttc:.1f} s",
@@ -2631,6 +3374,24 @@ def main():
                 (
                     f"GRU input: d={dist:.2f} m  close={closing_speed:+.2f}  YOLO={cls_name}  GRU-class={gru_cls_name}",
                     (235, 235, 235), 0.46, 1,
+                ),
+                (
+                    (
+                        (
+                            "Distance source: VISION OVERRIDE (long-range)"
+                            if ultrasonic_vision_override_active
+                            and vision_override_track is selected
+                            else (
+                                "Distance source: HC-SR04 (forward-axis YOLO object)"
+                                if ultrasonic_track is selected
+                                and getattr(ultrasonic_track, "source", "YOLO") == "YOLO"
+                                else "Distance source: HC-SR04 (independent obstacle)"
+                            )
+                        )
+                        if ultrasonic_track is selected
+                        else "Distance source: YOLO + MiDaS"
+                    ),
+                    (255, 255, 0), 0.44, 1,
                 ),
                 (
                     f"Proximity: {proximity_level} | Final: {final_risk:.3f} {final_bucket}",
@@ -2696,6 +3457,11 @@ def main():
                 (metric_status, (0, 255, 255), 0.46, 1),
                 (yolo_anchor_text, (255, 255, 0), 0.46, 1),
                 (f"MiDaS correction factor: {midas_corr:.2f}", (255, 255, 0), 0.46, 1),
+                (
+                    f"YOLO confidence: {getattr(selected, 'last_yolo_confidence', 0.0):.2f} | "
+                    f"vision score: {vision_override_score:.2f}",
+                    (255, 255, 0), 0.44, 1,
+                ),
                 ("Depth values provide relative correction evidence only.", (235, 235, 235), 0.44, 1),
                 ("Final bbox geometry: fused physical obstacles only.", (235, 235, 235), 0.44, 1),
             ]
@@ -2855,6 +3621,7 @@ def main():
     finally:
         midas_worker.stop()
         reader.release()
+        ultrasonic.stop()
         cv2.destroyAllWindows()
 
 
