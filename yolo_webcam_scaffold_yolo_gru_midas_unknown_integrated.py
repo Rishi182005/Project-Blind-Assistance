@@ -36,6 +36,11 @@ import pyttsx3
 import subprocess
 import os
 
+try:
+    from groq import Groq
+except Exception:
+    Groq = None
+
 # ---- laptop audio safety layer ----
 SPEECH_ENABLED = True
 SPEECH_RATE = 150
@@ -44,6 +49,16 @@ SPEECH_MEDIUM_REPEAT_S = 2.5
 SPEECH_DIRECTION_STABLE_S = 0.8
 SPEECH_LEFT_ZONE_FRAC = 0.34
 SPEECH_RIGHT_ZONE_FRAC = 0.66
+
+# ---- event-triggered LLM navigation layer ----
+# Groq is a secondary natural-language layer. It NEVER makes the safety
+# decision; the deterministic sensor-fusion + GRU path remains authoritative.
+GROQ_ENABLED = True
+GROQ_MODEL = "qwen/qwen3.6-27b"
+GROQ_TIMEOUT_S = 1.2
+GROQ_MAX_TOKENS = 50
+GROQ_DISTANCE_EVENT_M = 0.60
+GROQ_MIN_EVENT_INTERVAL_S = 2.00
 
 
 class SpeechManager:
@@ -282,6 +297,38 @@ class SpeechManager:
         except queue.Full:
             pass
 
+    def request_message(self, message, bucket, direction=None):
+        """Queue an already-generated navigation sentence without re-running
+        the deterministic speech-state gate. Used by the event-triggered LLM.
+        """
+        if not SPEECH_ENABLED or not self.running:
+            return
+        message = str(message).strip()
+        if not message:
+            return
+        bucket = str(bucket).upper()
+        try:
+            while True:
+                self.queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.queue.put_nowait((message, bucket, direction))
+            print(f"Speech: LLM queued -> {message}")
+        except queue.Full:
+            pass
+
+    def deterministic_fallback_message(self, bucket, direction):
+        bucket = str(bucket).upper()
+        direction = direction or "ahead"
+        if bucket == "CRITICAL":
+            return f"Stop. Critical obstacle on your {direction}."
+        if bucket == "HIGH":
+            return f"Stop. Obstacle on your {direction}."
+        if bucket == "MEDIUM":
+            return f"Caution. Obstacle on your {direction}."
+        return f"Caution. Obstacle on your {direction}."
+
     def stop(self):
         self.running = False
         try:
@@ -293,6 +340,245 @@ class SpeechManager:
             self.queue.put_nowait(None)
         except queue.Full:
             pass
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+
+class GroqNavigationManager:
+    """Event-triggered Groq navigation assistant.
+
+    Only meaningful state changes create an LLM request. The latest request
+    replaces stale pending context, and the deterministic safety path remains
+    available as a fallback.
+    """
+
+    def __init__(self, speech_manager):
+        self.speech = speech_manager
+
+        # Prefer the current process environment. If the key was added to the
+        # Windows User environment after this terminal was opened, also read
+        # the User-level environment value directly.
+        groq_api_key = os.environ.get("GROQ_API_KEY")
+        if not groq_api_key and os.name == "nt":
+            try:
+                import winreg
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Environment",
+                ) as key:
+                    groq_api_key, _ = winreg.QueryValueEx(
+                        key, "GROQ_API_KEY"
+                    )
+            except Exception:
+                groq_api_key = None
+
+        if groq_api_key:
+            os.environ["GROQ_API_KEY"] = str(groq_api_key)
+
+        self.enabled = bool(
+            GROQ_ENABLED
+            and Groq is not None
+            and groq_api_key
+        )
+        self.client = None
+        self.lock = threading.Lock()
+        self.pending = None
+        self.last_context = None
+        self.last_event_time = 0.0
+        self.last_spoken_message = None
+        self.bucket_change_candidate = None
+        self.bucket_change_start = None
+        self.running = True
+
+        # Build the Groq client before starting the worker. This removes a
+        # startup race where the worker could see enabled=True with client=None.
+        if self.enabled:
+            try:
+                self.client = Groq(timeout=GROQ_TIMEOUT_S)
+                print(f"Groq: enabled | model={GROQ_MODEL}")
+            except Exception as exc:
+                self.enabled = False
+                print(f"Groq: disabled (client init failed: {exc})")
+        else:
+            print("Groq: disabled (missing package or GROQ_API_KEY)")
+
+        self.thread = threading.Thread(
+            target=self._worker,
+            name="GroqNavigationWorker",
+            daemon=True,
+        )
+        self.thread.start()
+
+    @staticmethod
+    def _approach_state(closing_speed):
+        if closing_speed > 0.08:
+            return "approaching"
+        if closing_speed < -0.08:
+            return "moving away"
+        return "stationary"
+
+    def _make_context(self, bucket, obj_name, distance, direction, closing_speed, ttc):
+        return {
+            "bucket": str(bucket).upper(),
+            "object": str(obj_name),
+            "distance": float(distance),
+            "direction": str(direction or "ahead"),
+            "closing_speed": float(closing_speed),
+            "ttc": float(ttc) if ttc is not None and np.isfinite(ttc) and ttc < 900 else None,
+            "approach_state": self._approach_state(closing_speed),
+        }
+
+    def _meaningful_event(self, ctx, now):
+        previous = self.last_context
+        if previous is None:
+            return True
+
+        if now - self.last_event_time < GROQ_MIN_EVENT_INTERVAL_S:
+            return False
+
+        # A different physical obstacle or direction is a new event.
+        if ctx["object"] != previous["object"]:
+            return True
+        if ctx["direction"] != previous["direction"]:
+            return True
+
+        # Do not retrigger merely because the GRU flickers between MEDIUM/HIGH
+        # from frame to frame. Only a sustained increase in severity creates a
+        # new Groq event. A decrease never retriggers speech.
+        rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+        old_rank = rank.get(previous["bucket"], 0)
+        new_rank = rank.get(ctx["bucket"], 0)
+
+        if new_rank > old_rank:
+            candidate = (ctx["object"], ctx["direction"], ctx["bucket"])
+            if candidate != self.bucket_change_candidate:
+                self.bucket_change_candidate = candidate
+                self.bucket_change_start = now
+                return False
+            if (
+                self.bucket_change_start is None
+                or now - self.bucket_change_start < 1.0
+            ):
+                return False
+            self.bucket_change_candidate = None
+            self.bucket_change_start = None
+            return True
+
+        # Same severity: only a substantial distance change is meaningful.
+        if ctx["bucket"] == previous["bucket"]:
+            if abs(ctx["distance"] - previous["distance"]) >= GROQ_DISTANCE_EVENT_M:
+                return True
+
+        # Severity decrease / normal approach-state jitter: stay silent.
+        self.bucket_change_candidate = None
+        self.bucket_change_start = None
+        return False
+
+    def reset(self):
+        # Called when there is no selected obstacle. The next obstacle is then
+        # treated as a fresh event even if it has the same class/direction as
+        # the previous one.
+        with self.lock:
+            self.last_context = None
+            self.pending = None
+            self.bucket_change_candidate = None
+            self.bucket_change_start = None
+
+    def request(self, bucket, obj_name, distance, direction, closing_speed, ttc):
+        """Submit only meaningful navigation-state changes to Groq.
+
+        CRITICAL is intentionally not sent to Groq: immediate deterministic
+        safety speech must never wait for a network response.
+        """
+        bucket = str(bucket).upper()
+        if bucket == "CRITICAL":
+            return False
+        ctx = self._make_context(
+            bucket, obj_name, distance, direction, closing_speed, ttc
+        )
+        now = time.monotonic()
+        with self.lock:
+            if not self._meaningful_event(ctx, now):
+                return False
+            if self.pending is not None and ctx == self.pending:
+                return False
+            self.last_context = ctx
+            self.last_event_time = now
+            self.pending = ctx
+        print(
+            f"Groq: event queued | {ctx['bucket']} | {ctx['object']} | "
+            f"{ctx['distance']:.2f}m | {ctx['direction']}"
+        )
+        return True
+
+    def _prompt(self, ctx):
+        ttc_text = (f"{ctx['ttc']:.1f} s" if ctx["ttc"] is not None else "unavailable")
+        return f"""You are a wearable navigation assistant for a visually impaired user.
+Give ONE short spoken instruction, maximum 18 words.
+Use ONLY the supplied facts. Never invent an obstacle, distance, direction, movement, or safe escape route.
+Never tell the user to turn left/right, step back, or choose an escape route unless that safe route is explicitly supplied.
+Always include distance and direction when available. If approaching, say it is approaching.
+CRITICAL: start with Stop and tell the user not to move forward.
+HIGH: start with Stop and give a cautious instruction.
+MEDIUM: start with Caution and tell the user to slow down.
+LOW: brief awareness only.
+
+Object: {ctx['object']}
+Distance: {ctx['distance']:.2f} m
+Direction: {ctx['direction']}
+Closing speed: {ctx['closing_speed']:+.2f} m/s
+TTC: {ttc_text}
+Risk: {ctx['bucket']}
+"""
+
+    def _call_groq(self, ctx):
+        response = self.client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": self._prompt(ctx)}],
+            temperature=0,
+            max_tokens=GROQ_MAX_TOKENS,
+            reasoning_effort="none",
+        )
+        return response.choices[0].message.content.strip()
+
+    def _worker(self):
+        while self.running:
+            with self.lock:
+                ctx = self.pending
+                self.pending = None
+            if ctx is None:
+                time.sleep(0.05)
+                continue
+
+            if not self.enabled or self.client is None:
+                direction = ctx["direction"]
+                self.speech.request_message(
+                    self.speech.deterministic_fallback_message(ctx["bucket"], direction),
+                    ctx["bucket"],
+                    direction,
+                )
+                continue
+
+            try:
+                message = self._call_groq(ctx)
+                if not message:
+                    raise RuntimeError("empty Groq response")
+                print(f"Groq: response -> {message}")
+                self.speech.request_message(
+                    message, ctx["bucket"], ctx["direction"]
+                )
+            except Exception as exc:
+                print(f"Groq ERROR: {exc}")
+                self.speech.request_message(
+                    self.speech.deterministic_fallback_message(
+                        ctx["bucket"], ctx["direction"]
+                    ),
+                    ctx["bucket"],
+                    ctx["direction"],
+                )
+
+    def stop(self):
+        self.running = False
         if self.thread.is_alive():
             self.thread.join(timeout=2.0)
 
@@ -2312,10 +2598,23 @@ def safe_imshow(window_name, image):
     h, w = image.shape[:2]
     if h <= 0 or w <= 0:
         return
+
+    # Downscale only the GUI image. Processing remains at native resolution.
+    # This keeps the three-panel OpenCV window responsive on the laptop.
+    display = image
+    max_width = int(DISPLAY_MAX_WIDTH)
+    if max_width > 0 and w > max_width:
+        scale = max_width / float(w)
+        display = cv2.resize(
+            image,
+            (max_width, max(1, int(round(h * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+
     try:
         cv2.imshow(
             window_name,
-            np.ascontiguousarray(image),
+            np.ascontiguousarray(display),
         )
     except cv2.error as exc:
         print(f"OpenCV display warning: {exc}")
@@ -2491,6 +2790,7 @@ def main():
     reader = LatestFrameReader(SOURCE)
     ultrasonic = UltrasonicReceiver(host="0.0.0.0", port=4210)
     speech = SpeechManager()
+    groq_navigation = GroqNavigationManager(speech)
 
     try:
         reader.cap.set(
@@ -3568,15 +3868,57 @@ def main():
             # closing speed and class proxy. Keep the safety floor as an
             # additional guard, but do not overwrite those measurements.
             # ---------------------------------------------------------
-            # DETERMINISTIC SAFETY AUDIO
+            # AUDIO / LLM NAVIGATION LAYER
             # ---------------------------------------------------------
-            speech.request(
-                final_bucket,
-                selected,
-                w,
-                unknown_zone=unknown_zone,
-                forced_direction=selected_direction,
+            # CRITICAL hazards bypass the network and speak immediately.
+            # Other risk levels use event-triggered Groq for concise contextual
+            # guidance; the deterministic sentence is used if Groq is unavailable
+            # or fails.
+            # SpeechManager.request() already handles forced_direction.
+            # _direction() does not accept that argument.
+            speech_direction = (
+                selected_direction
+                if selected_direction
+                else speech._direction(
+                    selected, w, unknown_zone=unknown_zone
+                )
             )
+            current_ttc = (
+                selected.vision_ttc()
+                if (
+                    selected is not None
+                    and ultrasonic_vision_override_active
+                    and vision_override_track is selected
+                )
+                else (selected.ttc() if selected is not None else TTC_SAFE_VALUE)
+            )
+            if final_bucket == "CRITICAL":
+                speech.request(
+                    final_bucket,
+                    selected,
+                    w,
+                    unknown_zone=unknown_zone,
+                    forced_direction=selected_direction,
+                )
+            elif selected is not None:
+                groq_navigation.request(
+                    final_bucket,
+                    cls_name if cls_name != "none" else "obstacle",
+                    dist,
+                    speech_direction,
+                    closing_speed,
+                    current_ttc,
+                )
+            else:
+                # No selected obstacle: end the current Groq event episode.
+                groq_navigation.reset()
+                speech.request(
+                    final_bucket,
+                    selected,
+                    w,
+                    unknown_zone=unknown_zone,
+                    forced_direction=selected_direction,
+                )
 
             selected_source = (
                 "VISION OVERRIDE"
@@ -3975,6 +4317,7 @@ def main():
         midas_worker.stop()
         reader.release()
         ultrasonic.stop()
+        groq_navigation.stop()
         speech.stop()
         cv2.destroyAllWindows()
 

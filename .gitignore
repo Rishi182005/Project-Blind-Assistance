@@ -50,3 +50,9 @@ risk_gru_model_finetuned.keras
 *.log
 .vscode/
 .idea/
+
+# =========================
+# API keys
+# =========================
+gemini-api-key.txt
+groq-api-key.txt
