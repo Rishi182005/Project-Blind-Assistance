@@ -35,6 +35,7 @@ import queue
 import pyttsx3
 import subprocess
 import os
+import sys
 
 try:
     from groq import Groq
@@ -44,6 +45,9 @@ except Exception:
 # ---- laptop audio safety layer ----
 SPEECH_ENABLED = True
 SPEECH_RATE = 150
+# Piper local neural TTS settings. Voice files are downloaded once into the project folder.
+PIPER_MODEL_FILE = "en_US-lessac-medium.onnx"
+PIPER_LENGTH_SCALE = 1.075
 SPEECH_MIN_REPEAT_S = 1.8
 SPEECH_MEDIUM_REPEAT_S = 2.5
 SPEECH_DIRECTION_STABLE_S = 0.8
@@ -62,7 +66,7 @@ GROQ_MIN_EVENT_INTERVAL_S = 2.00
 
 
 class SpeechManager:
-    """Non-blocking Windows TTS that always speaks the newest warning."""
+    """Non-blocking local neural TTS that always speaks the newest warning."""
 
     def __init__(self):
         # Only one pending warning is useful: stale warnings must never build up.
@@ -81,24 +85,60 @@ class SpeechManager:
             daemon=True,
         )
         self.thread.start()
-        print("Speech: worker started")
+        print(f"Speech: Piper neural voice ready | model={PIPER_MODEL_FILE} | length_scale={PIPER_LENGTH_SCALE}")
 
     def _start_speak(self, message):
-        """Start one Windows SAPI utterance and return its process."""
+        """Start one local Piper neural-TTS utterance and return its process."""
         if os.name == "nt":
             env = os.environ.copy()
             env["WEARABLE_TTS_TEXT"] = str(message)
-            command = (
-                "$s=New-Object -ComObject SAPI.SpVoice; "
-                "$voices=$s.GetVoices(); "
-                "foreach($v in $voices){ if($v.GetAttribute('Gender') -eq 'Female'){ $s.Voice=$v; break } }; "
-                "$s.Rate=0; "
-                "$s.Speak($env:WEARABLE_TTS_TEXT); "
-                "$s=$null"
-            )
+
+            # Keep synthesis + playback inside one child process so the existing
+            # speech worker can still terminate an old warning immediately when
+            # a higher-severity warning arrives.
+            piper_code = """
+import os
+import tempfile
+import wave
+import winsound
+from pathlib import Path
+from piper import PiperVoice, SynthesisConfig
+
+text = os.environ.get("WEARABLE_TTS_TEXT", "").strip()
+model_path = Path(os.environ.get("WEARABLE_PIPER_MODEL", "en_US-lessac-medium.onnx"))
+length_scale = float(os.environ.get("WEARABLE_PIPER_LENGTH_SCALE", "1.075"))
+
+if not text:
+    raise SystemExit(0)
+
+if not model_path.exists():
+    raise FileNotFoundError(f"Piper voice model not found: {model_path}")
+
+voice = PiperVoice.load(model_path)
+fd, wav_path = tempfile.mkstemp(prefix="wearable_piper_", suffix=".wav")
+os.close(fd)
+
+try:
+    with wave.open(wav_path, "wb") as wav_file:
+        voice.synthesize_wav(
+            text,
+            wav_file,
+            syn_config=SynthesisConfig(length_scale=length_scale),
+        )
+    winsound.PlaySound(wav_path, winsound.SND_FILENAME)
+finally:
+    try:
+        os.remove(wav_path)
+    except OSError:
+        pass
+"""
+
+            env["WEARABLE_PIPER_MODEL"] = str(Path(PIPER_MODEL_FILE))
+            env["WEARABLE_PIPER_LENGTH_SCALE"] = str(PIPER_LENGTH_SCALE)
+
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             return subprocess.Popen(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                [sys.executable, "-c", piper_code],
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
