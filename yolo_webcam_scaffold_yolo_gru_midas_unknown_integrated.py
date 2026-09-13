@@ -1,3 +1,4 @@
+import math
 """
 YOLOv8n webcam/video scaffold for the wearable nav system -- MULTI-OBJECT
 TRACKING VERSION.
@@ -34,8 +35,13 @@ import socket
 import queue
 import pyttsx3
 import subprocess
+import tempfile
 import os
+if os.name == "nt":
+    import winsound
 import sys
+import re
+import multiprocessing as mp
 
 try:
     from groq import Groq
@@ -51,6 +57,17 @@ PIPER_LENGTH_SCALE = 1.075
 SPEECH_MIN_REPEAT_S = 1.8
 SPEECH_MEDIUM_REPEAT_S = 2.5
 SPEECH_DIRECTION_STABLE_S = 0.8
+
+# Stable-distance repetition guard: initial warning + at most two repeats.
+# Tiny distance jitter does not reset the counter.
+SPEECH_MAX_STABLE_REPEATS = 2
+SPEECH_DISTANCE_RESET_M = 0.15
+SPEECH_DISTANCE_RESET_FRAC = 0.15
+SPEECH_REPEAT_MIN_INTERVAL_S = 2.0
+
+# Only genuinely urgent warnings may cut an active sentence.
+SPEECH_INTERRUPT_COOLDOWN_S = 1.0
+
 SPEECH_LEFT_ZONE_FRAC = 0.34
 SPEECH_RIGHT_ZONE_FRAC = 0.66
 
@@ -65,13 +82,105 @@ GROQ_DISTANCE_EVENT_M = 0.60
 GROQ_MIN_EVENT_INTERVAL_S = 2.00
 
 
+class SpeechPlayback:
+    """Small handle for asynchronous Windows WAV playback."""
+    def __init__(self, wav_path, duration_s):
+        self.wav_path = wav_path
+        self.end_time = time.monotonic() + max(float(duration_s), 0.05)
+        self.cancelled = False
+
+    def poll(self):
+        if self.cancelled:
+            return 0
+        return None if time.monotonic() < self.end_time else 0
+
+    def terminate(self):
+        self.cancelled = True
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+        self._cleanup()
+
+    def wait(self, timeout=None):
+        if timeout is not None:
+            remaining = self.end_time - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(remaining, max(float(timeout), 0.0)))
+        self._cleanup()
+
+    def _cleanup(self):
+        if self.wav_path:
+            try:
+                os.remove(self.wav_path)
+            except OSError:
+                pass
+            self.wav_path = None
+
+
+def speech_friendly_units(message):
+    """Make spoken navigation units natural for Piper.
+
+    Distances below 1 metre are spoken in centimetres. Distances of 1 metre
+    or more are spoken in metres rounded to one decimal place. Speed units
+    are expanded so Piper says "meters per second" instead of "m slash s".
+    """
+    text = str(message)
+
+    def replace_distance(match):
+        value = float(match.group(1))
+        if value < 1.0:
+            return f"{round(value * 100):.0f} centimeters"
+        return f"{value:.1f} meters"
+
+    # Handle both numeric forms commonly produced by the navigation prompt.
+    text = re.sub(r"(?<![\w.])([0-9]+(?:\.[0-9]+)?)\s*(?:m|meters?)\b", replace_distance, text, flags=re.IGNORECASE)
+    text = re.sub(r"\bm\s*/\s*s\b", "meters per second", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bm/s\b", "meters per second", text, flags=re.IGNORECASE)
+    return text
+
+
+def _piper_synthesis_worker(request_queue, result_queue, model_file, length_scale):
+    """Persistent Piper worker process. Keeps neural TTS CPU work off the video process."""
+    try:
+        from piper import PiperVoice, SynthesisConfig
+        voice = PiperVoice.load(str(Path(model_file)))
+        synth_config = SynthesisConfig(length_scale=length_scale)
+        result_queue.put(("READY", None))
+    except Exception as exc:
+        result_queue.put(("ERROR", str(exc)))
+        return
+
+    while True:
+        item = request_queue.get()
+        if item is None:
+            break
+        message, wav_path = item
+        try:
+            import wave
+            with wave.open(wav_path, "wb") as wav_file:
+                voice.synthesize_wav(str(message), wav_file, syn_config=synth_config)
+            with wave.open(wav_path, "rb") as wav_file:
+                duration_s = wav_file.getnframes() / float(max(wav_file.getframerate(), 1))
+            result_queue.put(("OK", wav_path, duration_s))
+        except Exception as exc:
+            result_queue.put(("ERROR", str(exc)))
+
+
 class SpeechManager:
-    """Non-blocking local neural TTS that always speaks the newest warning."""
+    """Speech arbitration with persistent Piper and urgency-aware interruption."""
+
+    _SEVERITY = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 
     def __init__(self):
-        # Only one pending warning is useful: stale warnings must never build up.
+        # Only one pending item is useful. New scene snapshots replace stale ones.
         self.queue = queue.Queue(maxsize=1)
         self.last_message = None
+        self.ttc_alert_track = None
+        self.ttc_alert_until = 0.0
+        self.ttc_alert_last = 0.0
+        self.ttc_alert_safe_since = 0.0
         self.last_bucket = "LOW"
         self.last_direction = None
         self.last_spoken_time = 0.0
@@ -79,310 +188,469 @@ class SpeechManager:
         self.direction_candidate_since = 0.0
         self.running = True
         self.lock = threading.Lock()
-        self.thread = threading.Thread(
-            target=self._worker,
-            name="SpeechWorker",
+        self.active_playback = False
+        self.active_item = None
+        self.active_wav = None
+
+        # Per-track repetition state. A stable obstacle is not announced every frame.
+        self.repeat_state = {}
+        self.last_interrupt_time = 0.0
+
+        # Keep Piper loaded once. This removes the 6-7 second per-utterance model-load delay.
+        self.piper_request_queue = mp.Queue(maxsize=1)
+        self.piper_result_queue = mp.Queue()
+        self.piper_process = mp.Process(
+            target=_piper_synthesis_worker,
+            args=(
+                self.piper_request_queue,
+                self.piper_result_queue,
+                PIPER_MODEL_FILE,
+                PIPER_LENGTH_SCALE,
+            ),
             daemon=True,
         )
+        self.piper_process.start()
+        print(f"Speech: persistent Piper mode | model={PIPER_MODEL_FILE} | length_scale={PIPER_LENGTH_SCALE}")
+
+        self.thread = threading.Thread(target=self._worker, name="SpeechWorker", daemon=True)
         self.thread.start()
-        print(f"Speech: Piper neural voice ready | model={PIPER_MODEL_FILE} | length_scale={PIPER_LENGTH_SCALE}")
 
-    def _start_speak(self, message):
-        """Start one local Piper neural-TTS utterance and return its process."""
-        if os.name == "nt":
-            env = os.environ.copy()
-            env["WEARABLE_TTS_TEXT"] = str(message)
-
-            # Keep synthesis + playback inside one child process so the existing
-            # speech worker can still terminate an old warning immediately when
-            # a higher-severity warning arrives.
-            piper_code = """
-import os
-import tempfile
-import wave
-import winsound
-from pathlib import Path
-from piper import PiperVoice, SynthesisConfig
-
-text = os.environ.get("WEARABLE_TTS_TEXT", "").strip()
-model_path = Path(os.environ.get("WEARABLE_PIPER_MODEL", "en_US-lessac-medium.onnx"))
-length_scale = float(os.environ.get("WEARABLE_PIPER_LENGTH_SCALE", "1.075"))
-
-if not text:
-    raise SystemExit(0)
-
-if not model_path.exists():
-    raise FileNotFoundError(f"Piper voice model not found: {model_path}")
-
-voice = PiperVoice.load(model_path)
-fd, wav_path = tempfile.mkstemp(prefix="wearable_piper_", suffix=".wav")
-os.close(fd)
-
-try:
-    with wave.open(wav_path, "wb") as wav_file:
-        voice.synthesize_wav(
-            text,
-            wav_file,
-            syn_config=SynthesisConfig(length_scale=length_scale),
+    @staticmethod
+    def _message_distance(message):
+        match = re.search(
+            r"(?<![\w.])([0-9]+(?:\.[0-9]+)?)\s*(?:m|meters?|cm|centimeters?)\b",
+            str(message), re.IGNORECASE,
         )
-    winsound.PlaySound(wav_path, winsound.SND_FILENAME)
-finally:
-    try:
-        os.remove(wav_path)
-    except OSError:
-        pass
-"""
+        if not match:
+            return None
+        value = float(match.group(1))
+        unit = match.group(0).lower()
+        return value / 100.0 if ("cm" in unit or "centimeter" in unit) else value
 
-            env["WEARABLE_PIPER_MODEL"] = str(Path(PIPER_MODEL_FILE))
-            env["WEARABLE_PIPER_LENGTH_SCALE"] = str(PIPER_LENGTH_SCALE)
+    @staticmethod
+    def _transition_message(message):
+        text = str(message).strip()
+        if not text:
+            return text
+        # A short transition word makes an interruption audible as a change of state.
+        if not re.match(r"^(pardon|wait|attention)[,.!? ]", text, re.IGNORECASE):
+            return f"Pardon. {text}"
+        return text
 
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            return subprocess.Popen(
-                [sys.executable, "-c", piper_code],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=creationflags,
-            )
+    @classmethod
+    def _urgency_score(cls, item):
+        """Higher score = more urgent. Distance and TTC both contribute."""
+        _message, _bucket, _direction, distance, ttc, _track_key = item
+        score = 0.0
+        if distance is not None and math.isfinite(distance) and distance > 0:
+            score += 0.60 / max(distance, 0.05)
+        if ttc is not None and math.isfinite(ttc) and ttc > 0:
+            score += 0.40 / max(ttc, 0.10)
+        # Unknown metadata should not automatically beat a measured object.
+        return score
 
-        # Non-Windows fallback: not used on the target Windows laptop.
-        engine = pyttsx3.init()
-        engine.setProperty("rate", SPEECH_RATE)
-        engine.say(message)
-        engine.runAndWait()
-        engine.stop()
-        return None
+    @classmethod
+    def _should_interrupt(cls, old_item, new_item):
+        """Only a genuine increase in risk may interrupt current audio."""
+        if old_item is None:
+            return True
+        _om, old_bucket, _od, _old_dist, _old_ttc, _old_track = old_item
+        _nm, new_bucket, _nd, _new_dist, _new_ttc, _new_track = new_item
+        old_sev = cls._SEVERITY.get(str(old_bucket).upper(), 0)
+        new_sev = cls._SEVERITY.get(str(new_bucket).upper(), 0)
+        # Same-risk warnings NEVER interrupt one another. Distance/TTC changes
+        # are handled by the repeat gate after the current sentence finishes.
+        return new_sev > old_sev
 
-    def _worker(self):
-        current_process = None
-        current_item = None
+    @staticmethod
+    def _stable_distance_change(old_distance, new_distance):
+        if old_distance is None or new_distance is None:
+            return False
+        try:
+            old_distance = float(old_distance); new_distance = float(new_distance)
+        except Exception:
+            return False
+        if not (math.isfinite(old_distance) and math.isfinite(new_distance)):
+            return False
+        delta = abs(new_distance - old_distance)
+        relative = delta / max(abs(old_distance), 0.05)
+        return delta >= SPEECH_DISTANCE_RESET_M and relative >= SPEECH_DISTANCE_RESET_FRAC
 
-        while self.running:
-            if current_process is None:
+    def _allow_stable_repeat(self, item):
+        """Allow an initial warning and no more than two repeats at stable distance."""
+        _message, bucket, direction, distance, _ttc, track_key = item
+        key = ("track", track_key) if track_key is not None else ("anonymous", bucket, direction)
+        now = time.monotonic()
+        state = self.repeat_state.get(key)
+        if state is None:
+            self.repeat_state[key] = {"bucket": bucket, "direction": direction, "distance": distance, "count": 0, "last_time": 0.0}
+            return True
+        same_bucket = str(state["bucket"]).upper() == str(bucket).upper()
+        same_direction = state["direction"] == direction
+        distance_changed = self._stable_distance_change(state["distance"], distance)
+        if not same_bucket or not same_direction or distance_changed:
+            self.repeat_state[key] = {"bucket": bucket, "direction": direction, "distance": distance, "count": 0, "last_time": 0.0}
+            return True
+        if state["count"] >= SPEECH_MAX_STABLE_REPEATS:
+            return False
+        if now - float(state["last_time"]) < SPEECH_REPEAT_MIN_INTERVAL_S:
+            return False
+        state["count"] += 1
+        state["last_time"] = now
+        return True
+
+    def _forget_repeat_state_for_safe_scene(self):
+        self.repeat_state.clear()
+
+    def _synthesize(self, message):
+        """Synthesize with the already-loaded Piper process and return WAV path/duration."""
+        fd, wav_path = tempfile.mkstemp(prefix="wearable_piper_", suffix=".wav")
+        os.close(fd)
+        try:
+            # Keep the synthesis queue at one item and drain stale results first.
+            while True:
                 try:
-                    item = self.queue.get(timeout=0.1)
+                    self.piper_result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
+            try:
+                self.piper_request_queue.put((speech_friendly_units(message), wav_path), timeout=0.2)
+            except Exception:
+                os.remove(wav_path)
+                return None
+
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline and self.running:
+                try:
+                    result = self.piper_result_queue.get(timeout=0.05)
                 except queue.Empty:
                     continue
-                if item is None:
+                if not result:
+                    continue
+                if result[0] == "OK":
+                    return result[1], float(result[2])
+                if result[0] == "ERROR":
+                    print(f"Speech ERROR: Piper: {result[1]}")
                     break
-
-                message, bucket, direction = item
-                try:
-                    print(f"Speech: speaking -> {message}")
-                    # Start the cooldown when speech starts, so repeated frames
-                    # cannot create a backlog while this sentence is playing.
-                    with self.lock:
-                        self.last_spoken_time = time.monotonic()
-                    current_process = self._start_speak(message)
-                    current_item = item
-                except Exception as exc:
-                    print(f"Speech ERROR: {exc}")
-                    current_process = None
-                    current_item = None
-                continue
-
-            # While speech is playing, continuously look for a newer warning.
-            # If one arrives, stop the old utterance and immediately speak the new one.
-            if current_process.poll() is not None:
-                print("Speech: done")
-                current_process = None
-                current_item = None
-                continue
-
             try:
-                newer = self.queue.get(timeout=0.05)
-            except queue.Empty:
-                continue
-
-            if newer is None:
-                try:
-                    current_process.terminate()
-                    current_process.wait(timeout=0.5)
-                except Exception:
-                    pass
-                current_process = None
-                break
-
-            # A newer feed exists. Keep the current sentence intact so it is
-            # not cut off after only the first word. The newest warning stays
-            # in the one-item queue and will be spoken as soon as the current
-            # sentence finishes. If severity increases, interrupt immediately.
-            _old_message, old_bucket, _old_direction = current_item
-            _new_message, new_bucket, _new_direction = newer
-            severity = {"MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
-
-            if severity.get(new_bucket, 0) > severity.get(old_bucket, 0):
-                try:
-                    current_process.terminate()
-                    current_process.wait(timeout=0.5)
-                except Exception:
-                    try:
-                        current_process.kill()
-                    except Exception:
-                        pass
-
-                current_process = None
-                current_item = None
-                message, bucket, direction = newer
-                try:
-                    print(f"Speech: urgent latest -> {message}")
-                    with self.lock:
-                        self.last_spoken_time = time.monotonic()
-                    current_process = self._start_speak(message)
-                    current_item = newer
-                except Exception as exc:
-                    print(f"Speech ERROR: {exc}")
-            else:
-                # Put the newest warning back so it replaces any stale item
-                # and is spoken immediately after the current sentence.
-                try:
-                    while True:
-                        self.queue.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self.queue.put_nowait(newer)
-                    print(f"Speech: pending latest -> {newer[0]}")
-                except queue.Full:
-                    pass
-
-        if current_process is not None:
+                os.remove(wav_path)
+            except OSError:
+                pass
+            return None
+        except Exception as exc:
+            print(f"Speech ERROR: synthesis: {type(exc).__name__}: {exc!r}")
             try:
-                current_process.terminate()
-                current_process.wait(timeout=0.5)
+                os.remove(wav_path)
+            except OSError:
+                pass
+            return None
+
+    def _cancel_active(self):
+        """Stop current playback immediately; do not stop normal speech unless an urgent item wins."""
+        with self.lock:
+            was_active = bool(self.active_playback)
+            wav_path = self.active_wav
+            self.active_playback = False
+            self.active_item = None
+            self.active_wav = None
+        if was_active and os.name == "nt":
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
             except Exception:
                 pass
+        if wav_path:
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+        return was_active
+
+    def _worker(self):
+        current_item = None
+        current_wav = None
+        playback_end = 0.0
+
+        while self.running:
+            # Finish/cancel current playback without blocking the speech thread.
+            if current_item is not None:
+                if time.monotonic() >= playback_end:
+                    try:
+                        if os.name == "nt":
+                            winsound.PlaySound(None, winsound.SND_PURGE)
+                    except Exception:
+                        pass
+                    if current_wav:
+                        try:
+                            os.remove(current_wav)
+                        except OSError:
+                            pass
+                    with self.lock:
+                        self.active_playback = False
+                        self.active_item = None
+                        self.active_wav = None
+                    print("Speech: done")
+                    current_item = None
+                    current_wav = None
+                else:
+                    try:
+                        newer = self.queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if newer is None:
+                        self.running = False
+                        self._cancel_active()
+                        break
+                    if self._should_interrupt(current_item, newer):
+                        print(f"Speech: interrupt -> {newer[0]}")
+                        self._cancel_active()
+                        # Mark the transition explicitly in the spoken sentence.
+                        newer = (
+                            self._transition_message(newer[0]),
+                            newer[1], newer[2], newer[3], newer[4], newer[5],
+                        )
+                        current_item = None
+                        current_wav = None
+                    else:
+                        # The current sentence is still more urgent (or equally urgent).
+                        # Drop the new snapshot instead of replaying the same warning
+                        # immediately after the current sentence finishes.
+                        continue
+
+            try:
+                item = self.queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+
+            message, bucket, direction, distance, ttc, track_key = item
+            result = self._synthesize(message)
+            if result is None:
+                continue
+            wav_path, duration_s = result
+            if not self.running:
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
+                break
+
+            # It is possible for an urgent request to have arrived during synthesis.
+            try:
+                newer = self.queue.get_nowait()
+            except queue.Empty:
+                newer = None
+            if newer is not None and self._should_interrupt(item, newer):
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
+                newer = (
+                    self._transition_message(newer[0]),
+                    newer[1], newer[2], newer[3], newer[4], newer[5],
+                )
+                try:
+                    self.queue.put_nowait(newer)
+                except queue.Full:
+                    pass
+                continue
+            elif newer is not None:
+                # Do not keep a stale/equal-risk snapshot waiting behind the
+                # sentence that was just synthesized. If it is not urgent
+                # enough to interrupt, it is intentionally discarded.
+                pass
+
+            try:
+                winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                current_item = item
+                current_wav = wav_path
+                playback_end = time.monotonic() + max(duration_s, 0.05) + 0.05
+                with self.lock:
+                    self.active_playback = True
+                    self.active_item = item
+                    self.active_wav = wav_path
+                    self.last_spoken_time = time.monotonic()
+                print(f"Speech: speaking -> {message}")
+            except Exception as exc:
+                print(f"Speech ERROR: playback: {type(exc).__name__}: {exc!r}")
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
 
     def _direction(self, selected, frame_width, unknown_zone=""):
-        if selected is not None and getattr(selected, "box", None) is not None:
-            x1, _, x2, _ = selected.box
-            center_x = (float(x1) + float(x2)) / 2.0
-            frac = center_x / max(float(frame_width), 1.0)
-            if frac < SPEECH_LEFT_ZONE_FRAC:
-                return "left"
-            if frac > SPEECH_RIGHT_ZONE_FRAC:
-                return "right"
+        if selected is None:
             return "ahead"
-        zone = str(unknown_zone).upper()
-        if zone == "LEFT":
-            return "left"
-        if zone == "RIGHT":
-            return "right"
-        return "ahead"
+        box = getattr(selected, "box", None)
+        if box is None:
+            return "behind" if str(getattr(selected, "source", "")).upper() == "HC-SR04-REAR" else "ahead"
+        cx = (float(box[0]) + float(box[2])) / 2.0
+        if cx < frame_width * 0.33:
+            side = "left"
+        elif cx > frame_width * 0.67:
+            side = "right"
+        else:
+            side = "center"
+        if unknown_zone:
+            return f"{unknown_zone}-{side}" if side != "center" else unknown_zone
+        return side
 
     def request(self, final_bucket, selected, frame_width, unknown_zone="", forced_direction=None):
         if not SPEECH_ENABLED or not self.running:
             return
-
         bucket = str(final_bucket).upper()
-
-        # LOW clears the active warning. The next real hazard is a new event.
         if bucket == "LOW":
             with self.lock:
-                self.last_bucket = "LOW"
-                self.last_direction = None
-                self.last_message = None
-                self.direction_candidate = None
-                self.direction_candidate_since = 0.0
+                self.last_bucket = "LOW"; self.last_direction = None; self.last_message = None
+                self.direction_candidate = None; self.direction_candidate_since = 0.0
+            self._clear_queue(); self._forget_repeat_state_for_safe_scene(); return
+        if bucket not in self._SEVERITY:
             return
-
-        if bucket not in ("CRITICAL", "HIGH", "MEDIUM"):
-            return
-
-        direction = (forced_direction or self._direction(selected, frame_width, unknown_zone))
+        direction = forced_direction or self._direction(selected, frame_width, unknown_zone)
         now = time.monotonic()
-
-        # Ignore frame-to-frame left/right jitter. A direction must remain stable
-        # briefly before it can create a new spoken event.
         if direction != self.direction_candidate:
-            self.direction_candidate = direction
-            self.direction_candidate_since = now
-            if self.last_bucket != "LOW" and bucket == self.last_bucket:
-                return
-        elif now - self.direction_candidate_since < SPEECH_DIRECTION_STABLE_S:
-            if bucket == self.last_bucket:
-                return
-
-        if bucket == "CRITICAL":
-            message = f"Stop. Critical obstacle on your {direction}."
-        elif bucket == "HIGH":
-            message = f"Stop. Obstacle on your {direction}."
-        else:
-            message = f"Caution. Obstacle on your {direction}."
-
-        state_changed = (
-            bucket != self.last_bucket
-            or direction != self.last_direction
-        )
-
-        # IMPORTANT: do NOT repeat a persistent warning. Speech happens only
-        # when severity or a stable direction actually changes. LOW resets it.
-        if not state_changed:
+            self.direction_candidate = direction; self.direction_candidate_since = now
+        elif now - self.direction_candidate_since < SPEECH_DIRECTION_STABLE_S and bucket == self.last_bucket:
             return
+        message = (f"Stop. Critical obstacle on your {direction}." if bucket == "CRITICAL" else f"Stop. Obstacle on your {direction}." if bucket == "HIGH" else f"Caution. Obstacle on your {direction}.")
+        distance = None; ttc = None; track_key = None
+        if selected is not None:
+            track_key = getattr(selected, "track_id", id(selected))
+            try:
+                distance = float(getattr(selected, "distance_m", float("nan")))
+                if not math.isfinite(distance) or distance <= 0: distance = None
+            except Exception: distance = None
+            try:
+                ttc = float(selected.ttc())
+                if not math.isfinite(ttc) or ttc <= 0: ttc = None
+            except Exception: ttc = None
+        item = (speech_friendly_units(message), bucket, direction, distance, ttc, track_key)
 
-        # Replace any pending warning with the newest feed.
-        try:
-            while True:
-                self.queue.get_nowait()
-        except queue.Empty:
-            pass
+        # If a TTC emergency for this same track was just announced, suppress
+        # the generic CRITICAL sentence during the TTC cooldown. Otherwise the
+        # next frame can queue a second CRITICAL warning immediately.
+        if bucket == "CRITICAL" and track_key is not None:
+            if self.ttc_alert_track == track_key and now < self.ttc_alert_until:
+                return
+        with self.lock:
+            active_item = self.active_item; active = bool(self.active_playback)
+        if active:
+            if not self._should_interrupt(active_item, item):
+                return
+            if now - self.last_interrupt_time < SPEECH_INTERRUPT_COOLDOWN_S:
+                return
+            self.last_interrupt_time = now
+            print(f"Speech: interrupt -> {item[0]}")
+            item = (self._transition_message(item[0]), item[1], item[2], item[3], item[4], item[5])
+            self._cancel_active()
+        elif not self._allow_stable_repeat(item):
+            return
+        with self.lock:
+            self.last_bucket = bucket; self.last_direction = direction; self.last_message = item[0]
+        self._queue_latest(item, log_prefix="Speech: queued")
 
-        self.last_bucket = bucket
-        self.last_direction = direction
-        self.last_message = message
-
-        try:
-            self.queue.put_nowait((message, bucket, direction))
-            print(f"Speech: queued -> {message}")
-        except queue.Full:
-            pass
+    def request_ttc_alert(self, selected, frame_width, distance, closing_speed, ttc, direction=None):
+        if not SPEECH_ENABLED or not self.running or selected is None:
+            return False
+        now = time.monotonic(); track_key = getattr(selected, "track_id", id(selected))
+        danger = closing_speed >= TTC_SPEECH_MIN_CLOSING_SPEED and ttc <= TTC_SPEECH_TRIGGER_S
+        if not danger:
+            if ttc >= TTC_SPEECH_REARM_S or closing_speed <= 0:
+                if self.ttc_alert_safe_since <= 0.0: self.ttc_alert_safe_since = now
+                elif now - self.ttc_alert_safe_since >= TTC_SPEECH_REARM_STABLE_S:
+                    self.ttc_alert_track = None; self.ttc_alert_until = 0.0; self.ttc_alert_safe_since = 0.0
+            else: self.ttc_alert_safe_since = 0.0
+            return False
+        self.ttc_alert_safe_since = 0.0
+        if now - self.ttc_alert_last < TTC_SPEECH_COOLDOWN_S or (self.ttc_alert_track == track_key and now < self.ttc_alert_until):
+            return False
+        direction = direction or self._direction(selected, frame_width)
+        spoken_distance = f"{max(1, int(round(distance * 100.0)))} centimeters" if distance < 1.0 else f"{distance:.1f} meters"
+        text = (f"Stop. Fast approaching obstacle {spoken_distance} on your {direction}." if self.ttc_alert_track != track_key else f"Fast approaching obstacle {spoken_distance} on your {direction}.")
+        item = (speech_friendly_units(text), "CRITICAL", direction, float(distance) if distance > 0 else None, float(ttc) if ttc > 0 else None, track_key)
+        with self.lock:
+            active_item = self.active_item; active = bool(self.active_playback)
+        if active:
+            if not self._should_interrupt(active_item, item) or now - self.last_interrupt_time < SPEECH_INTERRUPT_COOLDOWN_S:
+                return False
+            self.last_interrupt_time = now
+            print(f"Speech: interrupt -> {item[0]}")
+            item = (self._transition_message(item[0]), item[1], item[2], item[3], item[4], item[5])
+            self._cancel_active()
+        self.ttc_alert_track = track_key; self.ttc_alert_until = now + TTC_SPEECH_COOLDOWN_S
+        self.ttc_alert_last = now; self.ttc_alert_safe_since = 0.0
+        self._clear_queue(); self._queue_latest(item, log_prefix=f"Speech: TTC emergency -> {item[0]}")
+        return True
 
     def request_message(self, message, bucket, direction=None):
-        """Queue an already-generated navigation sentence without re-running
-        the deterministic speech-state gate. Used by the event-triggered LLM.
-        """
         if not SPEECH_ENABLED or not self.running:
             return
-        message = str(message).strip()
+        message = speech_friendly_units(str(message).strip())
         if not message:
             return
-        bucket = str(bucket).upper()
+        bucket = str(bucket).upper(); distance = self._message_distance(message)
+        item = (message, bucket, direction, distance, None, None)
+        with self.lock:
+            active_item = self.active_item; active = bool(self.active_playback)
+        if active:
+            if not self._should_interrupt(active_item, item): return
+            if self._SEVERITY.get(bucket, 0) < self._SEVERITY.get(str(active_item[1]).upper(), 0): return
+            if time.monotonic() - self.last_interrupt_time < SPEECH_INTERRUPT_COOLDOWN_S: return
+            self.last_interrupt_time = time.monotonic()
+            print(f"Speech: interrupt -> {message}")
+            item = (self._transition_message(message), bucket, direction, distance, None, None)
+            self._cancel_active()
+        elif not self._allow_stable_repeat(item):
+            return
+        self._queue_latest(item, log_prefix="Speech: LLM queued")
+
+    def _clear_queue(self):
         try:
             while True:
                 self.queue.get_nowait()
         except queue.Empty:
             pass
+
+    def _queue_latest(self, item, log_prefix="Speech: queued"):
+        self._clear_queue()
         try:
-            self.queue.put_nowait((message, bucket, direction))
-            print(f"Speech: LLM queued -> {message}")
+            self.queue.put_nowait(item)
+            print(f"{log_prefix} -> {item[0]}")
         except queue.Full:
             pass
 
     def deterministic_fallback_message(self, bucket, direction):
         bucket = str(bucket).upper()
-        direction = direction or "ahead"
         if bucket == "CRITICAL":
-            return f"Stop. Critical obstacle on your {direction}."
+            return speech_friendly_units(f"Stop. Critical obstacle on your {direction}.")
         if bucket == "HIGH":
-            return f"Stop. Obstacle on your {direction}."
+            return speech_friendly_units(f"Stop. Obstacle on your {direction}.")
         if bucket == "MEDIUM":
-            return f"Caution. Obstacle on your {direction}."
-        return f"Caution. Obstacle on your {direction}."
+            return speech_friendly_units(f"Caution. Obstacle on your {direction}.")
+        return ""
 
     def stop(self):
         self.running = False
-        try:
-            while True:
-                self.queue.get_nowait()
-        except queue.Empty:
-            pass
+        self.repeat_state.clear()
+        self._cancel_active()
+        self._clear_queue()
         try:
             self.queue.put_nowait(None)
-        except queue.Full:
+        except Exception:
             pass
-        if self.thread.is_alive():
-            self.thread.join(timeout=2.0)
-
+        try:
+            self.piper_request_queue.put_nowait(None)
+        except Exception:
+            pass
+        try:
+            if self.piper_process is not None:
+                self.piper_process.join(timeout=1.0)
+                if self.piper_process.is_alive():
+                    self.piper_process.terminate()
+        except Exception:
+            pass
 
 class GroqNavigationManager:
     """Event-triggered Groq navigation assistant.
@@ -426,6 +694,7 @@ class GroqNavigationManager:
         self.last_context = None
         self.last_event_time = 0.0
         self.last_spoken_message = None
+        self.context_generation = 0
         self.bucket_change_candidate = None
         self.bucket_change_start = None
         self.running = True
@@ -519,6 +788,7 @@ class GroqNavigationManager:
         # treated as a fresh event even if it has the same class/direction as
         # the previous one.
         with self.lock:
+            self.context_generation += 1
             self.last_context = None
             self.pending = None
             self.bucket_change_candidate = None
@@ -558,6 +828,8 @@ Give ONE short spoken instruction, maximum 18 words.
 Use ONLY the supplied facts. Never invent an obstacle, distance, direction, movement, or safe escape route.
 Never tell the user to turn left/right, step back, or choose an escape route unless that safe route is explicitly supplied.
 Always include distance and direction when available. If approaching, say it is approaching.
+For distance in your spoken instruction, use centimetres below 1 metre (for example, 49 cm), and metres rounded to one decimal place at 1 metre or more (for example, 1.4 meters).
+Write speed units as "meters per second", never "m/s".
 CRITICAL: start with Stop and tell the user not to move forward.
 HIGH: start with Stop and give a cautious instruction.
 MEDIUM: start with Caution and tell the user to slow down.
@@ -604,11 +876,24 @@ Risk: {ctx['bucket']}
                 if not message:
                     raise RuntimeError("empty Groq response")
                 print(f"Groq: response -> {message}")
+                # The network response may arrive after the camera has already
+                # moved to a different obstacle or to a safe scene.  Never speak
+                # a response for an obsolete scene snapshot.
+                with self.lock:
+                    still_current = (self.last_context == ctx and self.pending is None)
+                if not still_current:
+                    print("Groq: stale response discarded")
+                    continue
                 self.speech.request_message(
                     message, ctx["bucket"], ctx["direction"]
                 )
             except Exception as exc:
                 print(f"Groq ERROR: {exc}")
+                with self.lock:
+                    still_current = (self.last_context == ctx and self.pending is None)
+                if not still_current:
+                    print("Groq: stale fallback discarded")
+                    continue
                 self.speech.request_message(
                     self.speech.deterministic_fallback_message(
                         ctx["bucket"], ctx["direction"]
@@ -816,6 +1101,13 @@ class LatestFrameReader:
 
     def __init__(self, source):
         self.cap = cv2.VideoCapture(source)
+        # Request the smallest capture buffer available. The reader thread
+        # already keeps only the newest decoded frame, so buffering old frames
+        # only adds latency. Some OpenCV backends may ignore this property.
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open source {source}")
         self.lock = threading.Lock()
@@ -1078,6 +1370,13 @@ MATCH_MAX_DIST_FRAC = 0.25       # max centroid movement (as a fraction of frame
 TRACK_TIMEOUT_S = 1.5            # keep a track through short YOLO dropouts
                                   # (object left frame / occluded)
 TTC_SAFE_VALUE = 999.0
+# TTC speech is an independent fast-closing safety trigger. It must not depend
+# on GRU bucket changes or Groq event gating.
+TTC_SPEECH_TRIGGER_S = 1.50
+TTC_SPEECH_REARM_S = 2.50
+TTC_SPEECH_MIN_CLOSING_SPEED = 0.12
+TTC_SPEECH_COOLDOWN_S = 2.50
+TTC_SPEECH_REARM_STABLE_S = 1.00
 UNKNOWN_REPLACEMENT_MARGIN_M = 0.15           # TTC assigned when an object isn't closing
 
 # V11: geometry/fusion guards.  MiDaS mask fragments are treated as one
@@ -1343,6 +1642,8 @@ class Track:
         self.vision_smoothed_dist = float(dist)
         self.vision_history = [(now, float(dist))]
         self.vision_filtered_closing_speed = 0.0
+        self.ttc_ema = TTC_SAFE_VALUE
+        self.vision_ttc_ema = TTC_SAFE_VALUE
 
     def _update_reference(self, area_frac, calibrated_dist):
         if self.reference_locked:
@@ -1477,14 +1778,19 @@ class Track:
     def closing_speed(self):
         if len(self.history) < 2:
             return 0.0
-        t0, d0 = self.history[0]
-        t1, d1 = self.history[-1]
-        dt = max(t1 - t0, 1e-3)
-        speed = (d0 - d1) / dt   # positive = getting closer
+        # Robust slope over the whole short history.  A simple first/last
+        # difference makes TTC explode when the distance estimate jitters by
+        # only a few centimetres.  Linear regression uses all samples and is
+        # much more stable for tracked vision distances.
+        times = np.asarray([t for t, _ in self.history], dtype=float)
+        distances = np.asarray([d for _, d in self.history], dtype=float)
+        times = times - times[0]
+        if len(times) < 3 or float(np.ptp(times)) < 1e-3:
+            return 0.0
+        slope = float(np.polyfit(times, distances, 1)[0])
+        speed = -slope  # positive = getting closer
         if abs(speed) < SPEED_DEADBAND:
             speed = 0.0
-        # Low-pass the derivative. Distance is already EMA-smoothed, but a
-        # derivative amplifies small frame-to-frame box jitter.
         self.filtered_closing_speed = (
             CLOSING_SPEED_EMA_ALPHA * speed
             + (1.0 - CLOSING_SPEED_EMA_ALPHA) * self.filtered_closing_speed
@@ -1497,10 +1803,13 @@ class Track:
         """Closing speed computed only from the independent vision history."""
         if len(self.vision_history) < 2:
             return 0.0
-        t0, d0 = self.vision_history[0]
-        t1, d1 = self.vision_history[-1]
-        dt = max(t1 - t0, 1e-3)
-        speed = (d0 - d1) / dt
+        times = np.asarray([t for t, _ in self.vision_history], dtype=float)
+        distances = np.asarray([d for _, d in self.vision_history], dtype=float)
+        times = times - times[0]
+        if len(times) < 3 or float(np.ptp(times)) < 1e-3:
+            return 0.0
+        slope = float(np.polyfit(times, distances, 1)[0])
+        speed = -slope
         if abs(speed) < SPEED_DEADBAND:
             speed = 0.0
         self.vision_filtered_closing_speed = (
@@ -1512,20 +1821,36 @@ class Track:
         return self.vision_filtered_closing_speed
 
     def vision_ttc(self):
-        """TTC computed from the independent vision metric stream."""
+        """Smoothed TTC computed from the independent vision metric stream."""
         speed = self.vision_closing_speed()
         if speed <= 0:
-            return TTC_SAFE_VALUE
-        return self.vision_smoothed_dist / speed
+            target = TTC_SAFE_VALUE
+        else:
+            target = self.vision_smoothed_dist / max(speed, TTC_SPEECH_MIN_CLOSING_SPEED)
+        if target >= TTC_SAFE_VALUE:
+            self.vision_ttc_ema = TTC_SAFE_VALUE
+        else:
+            if self.vision_ttc_ema >= TTC_SAFE_VALUE:
+                self.vision_ttc_ema = target
+            else:
+                self.vision_ttc_ema = 0.25 * target + 0.75 * self.vision_ttc_ema
+        return self.vision_ttc_ema
 
     def ttc(self):
-        """Time-to-collision estimate. Lower = more urgent.
-        Objects not closing in get a large 'safe' value so they never
-        outrank a genuine approaching threat."""
+        """Smoothed time-to-collision estimate. Lower = more urgent."""
         speed = self.closing_speed()
         if speed <= 0:
-            return TTC_SAFE_VALUE
-        return self.smoothed_dist / speed
+            target = TTC_SAFE_VALUE
+        else:
+            target = self.smoothed_dist / max(speed, TTC_SPEECH_MIN_CLOSING_SPEED)
+        if target >= TTC_SAFE_VALUE:
+            self.ttc_ema = TTC_SAFE_VALUE
+        else:
+            if self.ttc_ema >= TTC_SAFE_VALUE:
+                self.ttc_ema = target
+            else:
+                self.ttc_ema = 0.25 * target + 0.75 * self.ttc_ema
+        return self.ttc_ema
 
 
 def match_detections_to_tracks(detections, tracks, frame_width, frame_height, now):
@@ -1682,16 +2007,22 @@ def proximity_override(tr, frame_height, distance_override=None):
       - VERY close distance can force HIGH
       - A box reaching the bottom of the image can raise proximity risk
     """
-    if tr is None or tr.box is None:
+    if tr is None:
         return "NONE", "no selected obstacle"
 
-    x1, y1, x2, y2 = tr.box
-    bottom_frac = float(y2) / max(frame_height, 1)
+    # HC-SR04 virtual tracks intentionally have no camera bounding box.
+    # Their metric distance is still authoritative, so proximity safety must
+    # be evaluated before requiring a visual box.
     dist = (
         float(distance_override)
         if distance_override is not None
         else float(tr.smoothed_dist)
     )
+
+    bottom_frac = 0.0
+    if tr.box is not None:
+        x1, y1, x2, y2 = tr.box
+        bottom_frac = float(y2) / max(frame_height, 1)
 
     if dist <= PROXIMITY_CRITICAL_M:
         return "CRITICAL", f"distance {dist:.2f}m"
@@ -3932,7 +4263,21 @@ def main():
                 )
                 else (selected.ttc() if selected is not None else TTC_SAFE_VALUE)
             )
-            if final_bucket == "CRITICAL":
+            # Fast-closing TTC is an independent emergency speech path.
+            # It must fire even when GRU/Groq remains in MEDIUM/HIGH or when
+            # TTC itself briefly fluctuates around a threshold.
+            ttc_emergency_spoken = False
+            if selected is not None:
+                ttc_emergency_spoken = speech.request_ttc_alert(
+                    selected,
+                    w,
+                    dist,
+                    closing_speed,
+                    current_ttc,
+                    direction=speech_direction,
+                )
+
+            if final_bucket == "CRITICAL" and not ttc_emergency_spoken:
                 speech.request(
                     final_bucket,
                     selected,
