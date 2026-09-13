@@ -31,185 +31,425 @@ from tensorflow import keras
 import openvino as ov
 from pathlib import Path
 import socket
+import queue
+import pyttsx3
+import subprocess
+import os
+
+# ---- laptop audio safety layer ----
+SPEECH_ENABLED = True
+SPEECH_RATE = 150
+SPEECH_MIN_REPEAT_S = 1.8
+SPEECH_MEDIUM_REPEAT_S = 2.5
+SPEECH_DIRECTION_STABLE_S = 0.8
+SPEECH_LEFT_ZONE_FRAC = 0.34
+SPEECH_RIGHT_ZONE_FRAC = 0.66
+
+
+class SpeechManager:
+    """Non-blocking Windows TTS that always speaks the newest warning."""
+
+    def __init__(self):
+        # Only one pending warning is useful: stale warnings must never build up.
+        self.queue = queue.Queue(maxsize=1)
+        self.last_message = None
+        self.last_bucket = "LOW"
+        self.last_direction = None
+        self.last_spoken_time = 0.0
+        self.direction_candidate = None
+        self.direction_candidate_since = 0.0
+        self.running = True
+        self.lock = threading.Lock()
+        self.thread = threading.Thread(
+            target=self._worker,
+            name="SpeechWorker",
+            daemon=True,
+        )
+        self.thread.start()
+        print("Speech: worker started")
+
+    def _start_speak(self, message):
+        """Start one Windows SAPI utterance and return its process."""
+        if os.name == "nt":
+            env = os.environ.copy()
+            env["WEARABLE_TTS_TEXT"] = str(message)
+            command = (
+                "$s=New-Object -ComObject SAPI.SpVoice; "
+                "$voices=$s.GetVoices(); "
+                "foreach($v in $voices){ if($v.GetAttribute('Gender') -eq 'Female'){ $s.Voice=$v; break } }; "
+                "$s.Rate=0; "
+                "$s.Speak($env:WEARABLE_TTS_TEXT); "
+                "$s=$null"
+            )
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            return subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+
+        # Non-Windows fallback: not used on the target Windows laptop.
+        engine = pyttsx3.init()
+        engine.setProperty("rate", SPEECH_RATE)
+        engine.say(message)
+        engine.runAndWait()
+        engine.stop()
+        return None
+
+    def _worker(self):
+        current_process = None
+        current_item = None
+
+        while self.running:
+            if current_process is None:
+                try:
+                    item = self.queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    break
+
+                message, bucket, direction = item
+                try:
+                    print(f"Speech: speaking -> {message}")
+                    # Start the cooldown when speech starts, so repeated frames
+                    # cannot create a backlog while this sentence is playing.
+                    with self.lock:
+                        self.last_spoken_time = time.monotonic()
+                    current_process = self._start_speak(message)
+                    current_item = item
+                except Exception as exc:
+                    print(f"Speech ERROR: {exc}")
+                    current_process = None
+                    current_item = None
+                continue
+
+            # While speech is playing, continuously look for a newer warning.
+            # If one arrives, stop the old utterance and immediately speak the new one.
+            if current_process.poll() is not None:
+                print("Speech: done")
+                current_process = None
+                current_item = None
+                continue
+
+            try:
+                newer = self.queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+
+            if newer is None:
+                try:
+                    current_process.terminate()
+                    current_process.wait(timeout=0.5)
+                except Exception:
+                    pass
+                current_process = None
+                break
+
+            # A newer feed exists. Keep the current sentence intact so it is
+            # not cut off after only the first word. The newest warning stays
+            # in the one-item queue and will be spoken as soon as the current
+            # sentence finishes. If severity increases, interrupt immediately.
+            _old_message, old_bucket, _old_direction = current_item
+            _new_message, new_bucket, _new_direction = newer
+            severity = {"MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+            if severity.get(new_bucket, 0) > severity.get(old_bucket, 0):
+                try:
+                    current_process.terminate()
+                    current_process.wait(timeout=0.5)
+                except Exception:
+                    try:
+                        current_process.kill()
+                    except Exception:
+                        pass
+
+                current_process = None
+                current_item = None
+                message, bucket, direction = newer
+                try:
+                    print(f"Speech: urgent latest -> {message}")
+                    with self.lock:
+                        self.last_spoken_time = time.monotonic()
+                    current_process = self._start_speak(message)
+                    current_item = newer
+                except Exception as exc:
+                    print(f"Speech ERROR: {exc}")
+            else:
+                # Put the newest warning back so it replaces any stale item
+                # and is spoken immediately after the current sentence.
+                try:
+                    while True:
+                        self.queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.queue.put_nowait(newer)
+                    print(f"Speech: pending latest -> {newer[0]}")
+                except queue.Full:
+                    pass
+
+        if current_process is not None:
+            try:
+                current_process.terminate()
+                current_process.wait(timeout=0.5)
+            except Exception:
+                pass
+
+    def _direction(self, selected, frame_width, unknown_zone=""):
+        if selected is not None and getattr(selected, "box", None) is not None:
+            x1, _, x2, _ = selected.box
+            center_x = (float(x1) + float(x2)) / 2.0
+            frac = center_x / max(float(frame_width), 1.0)
+            if frac < SPEECH_LEFT_ZONE_FRAC:
+                return "left"
+            if frac > SPEECH_RIGHT_ZONE_FRAC:
+                return "right"
+            return "ahead"
+        zone = str(unknown_zone).upper()
+        if zone == "LEFT":
+            return "left"
+        if zone == "RIGHT":
+            return "right"
+        return "ahead"
+
+    def request(self, final_bucket, selected, frame_width, unknown_zone="", forced_direction=None):
+        if not SPEECH_ENABLED or not self.running:
+            return
+
+        bucket = str(final_bucket).upper()
+
+        # LOW clears the active warning. The next real hazard is a new event.
+        if bucket == "LOW":
+            with self.lock:
+                self.last_bucket = "LOW"
+                self.last_direction = None
+                self.last_message = None
+                self.direction_candidate = None
+                self.direction_candidate_since = 0.0
+            return
+
+        if bucket not in ("CRITICAL", "HIGH", "MEDIUM"):
+            return
+
+        direction = (forced_direction or self._direction(selected, frame_width, unknown_zone))
+        now = time.monotonic()
+
+        # Ignore frame-to-frame left/right jitter. A direction must remain stable
+        # briefly before it can create a new spoken event.
+        if direction != self.direction_candidate:
+            self.direction_candidate = direction
+            self.direction_candidate_since = now
+            if self.last_bucket != "LOW" and bucket == self.last_bucket:
+                return
+        elif now - self.direction_candidate_since < SPEECH_DIRECTION_STABLE_S:
+            if bucket == self.last_bucket:
+                return
+
+        if bucket == "CRITICAL":
+            message = f"Stop. Critical obstacle on your {direction}."
+        elif bucket == "HIGH":
+            message = f"Stop. Obstacle on your {direction}."
+        else:
+            message = f"Caution. Obstacle on your {direction}."
+
+        state_changed = (
+            bucket != self.last_bucket
+            or direction != self.last_direction
+        )
+
+        # IMPORTANT: do NOT repeat a persistent warning. Speech happens only
+        # when severity or a stable direction actually changes. LOW resets it.
+        if not state_changed:
+            return
+
+        # Replace any pending warning with the newest feed.
+        try:
+            while True:
+                self.queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        self.last_bucket = bucket
+        self.last_direction = direction
+        self.last_message = message
+
+        try:
+            self.queue.put_nowait((message, bucket, direction))
+            print(f"Speech: queued -> {message}")
+        except queue.Full:
+            pass
+
+    def stop(self):
+        self.running = False
+        try:
+            while True:
+                self.queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
 
 class UltrasonicReceiver:
-    """Receives HC-SR04 distance packets from the ESP32 over UDP."""
+    """Receives front/rear HC-SR04 distance packets from the ESP32 over UDP."""
 
     def __init__(self, host="0.0.0.0", port=4210):
         self.port = int(port)
-        self.latest_distance_cm = None
-        self.last_received_time = 0.0
-        self.history = deque(maxlen=8)
-        self.raw_history = deque(maxlen=ULTRASONIC_MEDIAN_WINDOW)
-        self.filtered_distance_cm = None
-
-        # State for rejecting sudden jumps to a farther background surface.
-        self.far_jump_candidate_cm = None
-        self.far_jump_start_time = None
-
         self.lock = threading.Lock()
         self.running = True
 
-        self.sock = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_DGRAM
-        )
-        self.sock.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_REUSEADDR,
-            1
-        )
+        # Each sensor has its own independent filtering/history state.
+        self.channels = {
+            "front": {
+                "latest_distance_cm": None,
+                "last_received_time": 0.0,
+                "history": deque(maxlen=8),
+                "raw_history": deque(maxlen=ULTRASONIC_MEDIAN_WINDOW),
+                "filtered_distance_cm": None,
+                "far_jump_candidate_cm": None,
+                "far_jump_start_time": None,
+            },
+            "rear": {
+                "latest_distance_cm": None,
+                "last_received_time": 0.0,
+                "history": deque(maxlen=8),
+                "raw_history": deque(maxlen=ULTRASONIC_MEDIAN_WINDOW),
+                "filtered_distance_cm": None,
+                "far_jump_candidate_cm": None,
+                "far_jump_start_time": None,
+            },
+        }
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, self.port))
         self.sock.settimeout(0.2)
 
         self.thread = threading.Thread(
             target=self._receive_loop,
             name="UltrasonicReceiver",
-            daemon=True
+            daemon=True,
         )
         self.thread.start()
 
         print(f"Ultrasonic UDP receiver listening on port {self.port}")
+        print("Ultrasonic channels: FRONT + REAR")
+
+    def _update_channel(self, channel, distance_cm, now):
+        state = self.channels[channel]
+        if not (ULTRASONIC_MIN_CM <= distance_cm <= ULTRASONIC_MAX_CM):
+            return
+
+        state["raw_history"].append(distance_cm)
+        median_cm = float(np.median(np.asarray(state["raw_history"], dtype=np.float32)))
+
+        if state["filtered_distance_cm"] is None:
+            state["filtered_distance_cm"] = median_cm
+            state["far_jump_candidate_cm"] = None
+            state["far_jump_start_time"] = None
+        else:
+            current_cm = float(state["filtered_distance_cm"])
+            jump_cm = median_cm - current_cm
+
+            if jump_cm > ULTRASONIC_FAR_JUMP_CM:
+                if state["far_jump_candidate_cm"] is None:
+                    state["far_jump_candidate_cm"] = median_cm
+                    state["far_jump_start_time"] = now
+                else:
+                    state["far_jump_candidate_cm"] = (
+                        0.5 * state["far_jump_candidate_cm"] + 0.5 * median_cm
+                    )
+
+                candidate_age = (
+                    now - state["far_jump_start_time"]
+                    if state["far_jump_start_time"] is not None
+                    else 0.0
+                )
+                candidate_stability = abs(
+                    median_cm - state["far_jump_candidate_cm"]
+                )
+
+                if (
+                    candidate_age >= ULTRASONIC_FAR_JUMP_CONFIRM_S
+                    and candidate_stability <= ULTRASONIC_FAR_JUMP_STABILITY_CM
+                ):
+                    state["filtered_distance_cm"] = (
+                        ULTRASONIC_EMA_ALPHA * median_cm
+                        + (1.0 - ULTRASONIC_EMA_ALPHA) * current_cm
+                    )
+                    state["far_jump_candidate_cm"] = None
+                    state["far_jump_start_time"] = None
+                else:
+                    state["filtered_distance_cm"] = current_cm
+            else:
+                state["far_jump_candidate_cm"] = None
+                state["far_jump_start_time"] = None
+                state["filtered_distance_cm"] = (
+                    ULTRASONIC_EMA_ALPHA * median_cm
+                    + (1.0 - ULTRASONIC_EMA_ALPHA) * current_cm
+                )
+
+        filtered_cm = float(state["filtered_distance_cm"])
+        state["latest_distance_cm"] = filtered_cm
+        state["last_received_time"] = now
+        state["history"].append((now, filtered_cm))
 
     def _receive_loop(self):
         while self.running:
             try:
                 data, _ = self.sock.recvfrom(1024)
-
             except socket.timeout:
                 continue
-
             except OSError:
                 break
 
             try:
                 text = data.decode("utf-8").strip()
-
-                # ESP32 sends:
-                # distance_cm:123.4,ts:123456
                 parts = {}
-
                 for item in text.split(","):
                     if ":" in item:
                         key, value = item.split(":", 1)
-                        parts[key] = value
+                        parts[key.strip()] = value.strip()
 
-                distance_cm = float(parts["distance_cm"])
+                now = time.monotonic()
 
-                # Ignore invalid/impossible HC-SR04 packets. In particular,
-                # readings beyond the configured 4 m range must not appear in
-                # the UI or become navigation obstacles.
-                if (
-                    ULTRASONIC_MIN_CM <= distance_cm <= ULTRASONIC_MAX_CM
-                ):
-                    with self.lock:
-                        now = time.monotonic()
+                # Preferred dual-sensor packet:
+                # front_cm:123.4,rear_cm:234.5,ts:123456
+                # Also accept front: / rear: aliases.
+                if "front_cm" in parts or "front" in parts:
+                    front_value = parts.get("front_cm", parts.get("front"))
+                    if front_value is not None:
+                        self._update_channel("front", float(front_value), now)
 
-                        # Robust filtering:
-                        # 1) Median of the latest 5 readings removes isolated spikes.
-                        # 2) A sudden FAR jump is held temporarily because the
-                        #    sensor may have lost the target and hit the background.
-                        # 3) A closer reading is accepted immediately for safety.
-                        # 4) EMA smooths ordinary frame-to-frame fluctuations.
-                        self.raw_history.append(distance_cm)
-                        median_cm = float(
-                            np.median(
-                                np.asarray(self.raw_history, dtype=np.float32)
-                            )
-                        )
+                if "rear_cm" in parts or "rear" in parts:
+                    rear_value = parts.get("rear_cm", parts.get("rear"))
+                    if rear_value is not None:
+                        self._update_channel("rear", float(rear_value), now)
 
-                        if self.filtered_distance_cm is None:
-                            self.filtered_distance_cm = median_cm
-                            self.far_jump_candidate_cm = None
-                            self.far_jump_start_time = None
-                        else:
-                            current_cm = float(self.filtered_distance_cm)
-                            jump_cm = median_cm - current_cm
+                # Backward compatibility with the original one-sensor firmware.
+                elif "distance_cm" in parts:
+                    self._update_channel("front", float(parts["distance_cm"]), now)
 
-                            if jump_cm > ULTRASONIC_FAR_JUMP_CM:
-                                if self.far_jump_candidate_cm is None:
-                                    self.far_jump_candidate_cm = median_cm
-                                    self.far_jump_start_time = now
-                                else:
-                                    self.far_jump_candidate_cm = (
-                                        0.5 * self.far_jump_candidate_cm
-                                        + 0.5 * median_cm
-                                    )
-
-                                candidate_age = (
-                                    now - self.far_jump_start_time
-                                    if self.far_jump_start_time is not None
-                                    else 0.0
-                                )
-                                candidate_stability = abs(
-                                    median_cm - self.far_jump_candidate_cm
-                                )
-
-                                if (
-                                    candidate_age >= ULTRASONIC_FAR_JUMP_CONFIRM_S
-                                    and candidate_stability
-                                    <= ULTRASONIC_FAR_JUMP_STABILITY_CM
-                                ):
-                                    self.filtered_distance_cm = (
-                                        ULTRASONIC_EMA_ALPHA * median_cm
-                                        + (1.0 - ULTRASONIC_EMA_ALPHA)
-                                        * current_cm
-                                    )
-                                    self.far_jump_candidate_cm = None
-                                    self.far_jump_start_time = None
-                                else:
-                                    self.filtered_distance_cm = current_cm
-                            else:
-                                self.far_jump_candidate_cm = None
-                                self.far_jump_start_time = None
-                                self.filtered_distance_cm = (
-                                    ULTRASONIC_EMA_ALPHA * median_cm
-                                    + (1.0 - ULTRASONIC_EMA_ALPHA)
-                                    * current_cm
-                                )
-
-                        filtered_cm = float(self.filtered_distance_cm)
-
-                        self.latest_distance_cm = filtered_cm
-                        self.last_received_time = now
-                        self.history.append((now, filtered_cm))
-
-            except (
-                UnicodeDecodeError,
-                ValueError,
-                KeyError
-            ):
+            except (UnicodeDecodeError, ValueError, KeyError):
                 continue
 
-    def get_latest(self, max_age_s=0.5):
-        """Return the newest distance in cm, or None if it is stale."""
-
+    def _get_channel_with_speed(self, channel, max_age_s):
         with self.lock:
-            distance_cm = self.latest_distance_cm
-            received_time = self.last_received_time
+            state = self.channels[channel]
+            distance_cm = state["latest_distance_cm"]
+            received_time = state["last_received_time"]
+            samples = list(state["history"])
 
-        if distance_cm is None:
-            return None
-
-        if time.monotonic() - received_time > max_age_s:
-            return None
-
-        return float(distance_cm)
-
-    def get_latest_with_speed(self, max_age_s=0.5):
-        """Return (distance_cm, closing_speed_mps) from recent HC-SR04 samples."""
-        with self.lock:
-            distance_cm = self.latest_distance_cm
-            received_time = self.last_received_time
-            samples = list(self.history)
-
-        if distance_cm is None:
-            return None, 0.0
-        if time.monotonic() - received_time > max_age_s:
+        if distance_cm is None or time.monotonic() - received_time > max_age_s:
             return None, 0.0
 
-        # Use a short baseline so the ultrasonic derivative is less sensitive
-        # to individual noisy pings. Positive = obstacle getting closer.
         if len(samples) >= 2:
             t0, d0 = samples[0]
             t1, d1 = samples[-1]
@@ -222,14 +462,22 @@ class UltrasonicReceiver:
 
         return float(distance_cm), float(closing_speed)
 
+    def get_latest_with_speed(self, max_age_s=0.5):
+        """Backward-compatible front-sensor accessor."""
+        return self._get_channel_with_speed("front", max_age_s)
+
+    def get_latest_pair_with_speed(self, max_age_s=0.5):
+        """Return (front_cm, front_speed, rear_cm, rear_speed)."""
+        front = self._get_channel_with_speed("front", max_age_s)
+        rear = self._get_channel_with_speed("rear", max_age_s)
+        return front[0], front[1], rear[0], rear[1]
+
     def stop(self):
         self.running = False
-
         try:
             self.sock.close()
         except OSError:
             pass
-
         if self.thread.is_alive():
             self.thread.join(timeout=1.0)
 
@@ -425,6 +673,9 @@ SPEED_WINDOW = 8                 # frames of history kept per tracked object
 ULTRASONIC_FUSION_ENABLED = True
 ULTRASONIC_MAX_AGE_S = 0.5
 ULTRASONIC_CENTER_TOL_FRAC = 0.15
+# Front HC-SR04 is matched to the closest YOLO/MiDaS bbox by metric distance.
+# If no visual bbox is close enough, the ultrasonic obstacle is classified FRONT.
+ULTRASONIC_BBOX_MATCH_TOL_M = 0.50
 ULTRASONIC_MIN_CM = 2.0
 ULTRASONIC_MAX_CM = 400.0
 ULTRASONIC_MEDIAN_WINDOW = 5
@@ -2239,6 +2490,7 @@ def main():
 
     reader = LatestFrameReader(SOURCE)
     ultrasonic = UltrasonicReceiver(host="0.0.0.0", port=4210)
+    speech = SpeechManager()
 
     try:
         reader.cap.set(
@@ -2261,6 +2513,9 @@ def main():
     # Persistent fallback obstacle used when HC-SR04 has a valid reading but
     # neither YOLO nor MiDaS provides a corresponding object.
     ultrasonic_virtual_track = None
+    rear_ultrasonic_virtual_track = None
+    front_ultrasonic_match = None
+    ultrasonic_direction = None
 
     # Long-range vision-assisted ultrasonic override state.
     ultrasonic_vision_candidate_key = None
@@ -2858,109 +3113,157 @@ def main():
 
 
             # ---------------------------------------------------------
-            # HC-SR04 PRIORITY / METRIC OVERRIDE
+            # DUAL HC-SR04 FUSION / DIRECTION
             # ---------------------------------------------------------
-            # Policy:
-            #   1. A fresh valid HC-SR04 reading has priority.
-            #   2. If a YOLO object is close to the sensor's forward image axis,
-            #      keep its semantic identity/bounding box and replace its
-            #      metric distance with HC-SR04.
-            #   3. If YOLO/MiDaS do NOT provide a matching object, create a
-            #      virtual "HC-SR04 obstacle" so the ultrasonic detection is
-            #      still selected and sent to the GRU.
+            # FRONT sensor:
+            #   - supplies authoritative metric distance
+            #   - find the visual bbox (YOLO or confirmed MiDaS) whose
+            #     estimated distance is closest to that reading
+            #   - if a match exists, use that bbox's horizontal zone:
+            #       FRONT-LEFT / FRONT / FRONT-RIGHT
+            #   - if no match exists, classify the ultrasonic obstacle FRONT
             #
-            # This makes the ultrasonic sensor an independent safety channel.
-            # IMPORTANT: one HC-SR04 cannot identify what it hit. If its beam
-            # misses a small object, it can legitimately measure the wall behind
-            # it; software cannot distinguish those two cases from one reading.
+            # REAR sensor:
+            #   - independent metric safety channel
+            #   - always classified BACK (no camera matching)
             # ---------------------------------------------------------
-            ultrasonic_distance_cm, ultrasonic_closing_speed = (
-                ultrasonic.get_latest_with_speed(
+            (
+                ultrasonic_distance_cm,
+                ultrasonic_closing_speed,
+                rear_ultrasonic_distance_cm,
+                rear_ultrasonic_closing_speed,
+            ) = (
+                ultrasonic.get_latest_pair_with_speed(
                     max_age_s=ULTRASONIC_MAX_AGE_S
                 )
                 if ULTRASONIC_FUSION_ENABLED
-                else (None, 0.0)
+                else (None, 0.0, None, 0.0)
             )
 
             ultrasonic_track = None
+            rear_ultrasonic_track = None
+            front_ultrasonic_match = None
+            ultrasonic_direction = None
 
-            if ultrasonic_distance_cm is not None:
-                frame_center_x = w / 2.0
-                center_limit = w * ULTRASONIC_CENTER_TOL_FRAC
-                center_candidates = []
+            def _apply_ultrasonic_measurement(track, distance_cm, closing_speed, label):
+                if distance_cm is None:
+                    return track
 
-                for tr in final_obstacles:
-                    if tr.box is None:
-                        continue
-                    x1, _, x2, _ = tr.box
-                    box_center_x = (x1 + x2) / 2.0
-                    center_error = abs(box_center_x - frame_center_x)
-                    if center_error <= center_limit:
-                        center_candidates.append((center_error, tr))
+                distance_m = float(
+                    np.clip(distance_cm / 100.0, 0.02, MAX_RANGE)
+                )
 
-                # Prefer the closest-to-axis YOLO object for semantic identity.
-                if center_candidates:
-                    _, ultrasonic_track = min(
-                        center_candidates,
-                        key=lambda item: item[0]
+                created_virtual = track is None
+                if created_virtual:
+                    track = Track(
+                        f"{label} ultrasonic obstacle",
+                        (w / 2.0, h * 0.70),
+                        distance_m,
+                        now,
+                        box=None,
+                        frame_area=w * h,
                     )
-                else:
-                    # No YOLO/MiDaS object corresponds to the forward ultrasonic
-                    # return. Keep the sensor reading as an independent obstacle.
-                    if ultrasonic_virtual_track is None:
-                        ultrasonic_virtual_track = Track(
-                            "ultrasonic obstacle",
-                            (frame_center_x, h * 0.70),
-                            ultrasonic_distance_cm / 100.0,
+
+                if not getattr(track, "ultrasonic_active", False):
+                    track.history = []
+                    track.distance_history.clear()
+                    track.filtered_closing_speed = 0.0
+                    track.ultrasonic_active = True
+
+                track.smoothed_dist = distance_m
+                track.distance_history.append(distance_m)
+                track.history.append((now, distance_m))
+                if len(track.history) > SPEED_WINDOW:
+                    track.history.pop(0)
+                track.filtered_closing_speed = closing_speed
+                track.last_seen = now
+                track.source = "HC-SR04"
+                if created_virtual:
+                    track.box = None
+                    track.centroid = (w / 2.0, h * 0.70)
+                    track.cls_name = f"{label.lower()} ultrasonic obstacle"
+                track.last_yolo_distance = distance_m
+                track.last_midas_ratio = 1.0
+                track.last_midas_correction = 1.0
+                track.last_midas_strength = 0.0
+                return track
+
+            # ---------- FRONT HC-SR04 ----------
+            if ultrasonic_distance_cm is not None:
+                front_m = float(ultrasonic_distance_cm / 100.0)
+                visual_candidates = [
+                    tr for tr in final_obstacles
+                    if tr.box is not None
+                ]
+
+                if visual_candidates:
+                    # Match by metric distance, not by image center. This lets
+                    # the bbox determine left/front/right after the ultrasonic
+                    # sensor identifies which visual obstacle it corresponds to.
+                    front_ultrasonic_match = min(
+                        visual_candidates,
+                        key=lambda tr: abs(float(tr.smoothed_dist) - front_m),
+                    )
+                    match_error = abs(
+                        float(front_ultrasonic_match.smoothed_dist) - front_m
+                    )
+                    if match_error <= max(
+                        ULTRASONIC_BBOX_MATCH_TOL_M,
+                        0.25 * max(front_m, 1.0),
+                    ):
+                        ultrasonic_track = front_ultrasonic_match
+                        ultrasonic_direction = "front"
+                        box_center_x = (
+                            float(front_ultrasonic_match.box[0])
+                            + float(front_ultrasonic_match.box[2])
+                        ) / 2.0
+                        frac = box_center_x / max(float(w), 1.0)
+                        if frac < SPEECH_LEFT_ZONE_FRAC:
+                            ultrasonic_direction = "front-left"
+                        elif frac > SPEECH_RIGHT_ZONE_FRAC:
+                            ultrasonic_direction = "front-right"
+                    else:
+                        front_ultrasonic_match = None
+
+                if ultrasonic_track is None:
+                    ultrasonic_track = ultrasonic_virtual_track
+                    if ultrasonic_track is None:
+                        ultrasonic_track = Track(
+                            "front ultrasonic obstacle",
+                            (w / 2.0, h * 0.70),
+                            front_m,
                             now,
                             box=None,
                             frame_area=w * h,
                         )
-                    ultrasonic_track = ultrasonic_virtual_track
-                    ultrasonic_track.cls_name = "ultrasonic obstacle"
-                    ultrasonic_track.source = "HC-SR04"
-                    ultrasonic_track.centroid = (frame_center_x, h * 0.70)
-                    ultrasonic_track.last_seen = now
-                    ultrasonic_track.box = None
+                        ultrasonic_virtual_track = ultrasonic_track
+                    ultrasonic_direction = "front"
 
-                ultrasonic_m = float(
-                    np.clip(
-                        ultrasonic_distance_cm / 100.0,
-                        0.02,
-                        MAX_RANGE,
-                    )
-                )
-
-                # Switch the selected track to authoritative ultrasonic metric
-                # history. This prevents bad YOLO distance estimates from
-                # contaminating the GRU when the ultrasonic channel is active.
-                if not getattr(
+                ultrasonic_track = _apply_ultrasonic_measurement(
                     ultrasonic_track,
-                    "ultrasonic_active",
-                    False,
-                ):
-                    ultrasonic_track.history = []
-                    ultrasonic_track.distance_history.clear()
-                    ultrasonic_track.filtered_closing_speed = 0.0
-                    ultrasonic_track.ultrasonic_active = True
-
-                ultrasonic_track.smoothed_dist = ultrasonic_m
-                ultrasonic_track.distance_history.append(ultrasonic_m)
-                ultrasonic_track.history.append(
-                    (now, ultrasonic_m)
+                    ultrasonic_distance_cm,
+                    ultrasonic_closing_speed,
+                    "Front",
                 )
-                if len(ultrasonic_track.history) > SPEED_WINDOW:
-                    ultrasonic_track.history.pop(0)
-                ultrasonic_track.filtered_closing_speed = ultrasonic_closing_speed
 
-                # The virtual track has no semantic class; when a YOLO object
-                # exists, retain its real class name for display/GRU mapping.
-                if ultrasonic_track is ultrasonic_virtual_track:
-                    ultrasonic_track.last_yolo_distance = ultrasonic_m
-                    ultrasonic_track.last_midas_ratio = 1.0
-                    ultrasonic_track.last_midas_correction = 1.0
-                    ultrasonic_track.last_midas_strength = 0.0
+                # Preserve the matched visual bbox/semantic identity when the
+                # front sensor corresponds to YOLO/MiDaS. The ultrasonic
+                # distance remains authoritative.
+                if front_ultrasonic_match is not None:
+                    ultrasonic_track = front_ultrasonic_match
+                    ultrasonic_track.smoothed_dist = front_m
+                    ultrasonic_track.filtered_closing_speed = ultrasonic_closing_speed
+                    ultrasonic_track.last_seen = now
 
+            # ---------- REAR HC-SR04 ----------
+            if rear_ultrasonic_distance_cm is not None:
+                rear_ultrasonic_track = _apply_ultrasonic_measurement(
+                    rear_ultrasonic_virtual_track,
+                    rear_ultrasonic_distance_cm,
+                    rear_ultrasonic_closing_speed,
+                    "Rear",
+                )
+                rear_ultrasonic_virtual_track = rear_ultrasonic_track
 
             # ---------------------------------------------------------
             # LONG-RANGE VISION-ASSISTED ULTRASONIC FAILSAFE
@@ -3091,21 +3394,39 @@ def main():
                 ultrasonic_vision_override_active = False
                 ultrasonic_vision_override_track = None
 
-            # Unified obstacle selection from the FINAL top-3 set.
-            # HC-SR04 remains the default. A confirmed long-range vision
-            # obstacle is the only exception.
-            selected = (
-                vision_override_track
-                if vision_override_track is not None
-                else (
-                    ultrasonic_track
-                    if ultrasonic_track is not None
-                    else (
-                        min(final_obstacles, key=lambda t: t.ttc())
-                        if final_obstacles else None
-                    )
+            # Unified obstacle selection.
+            # A confirmed long-range vision override remains first priority.
+            # Otherwise choose the most urgent fresh ultrasonic channel (front
+            # or rear) by TTC. If neither ultrasonic channel is fresh, fall back
+            # to the normal visual TTC selection.
+            ultrasonic_candidates = [
+                tr for tr in (ultrasonic_track, rear_ultrasonic_track)
+                if tr is not None
+            ]
+            safety_candidates = list(ultrasonic_candidates)
+            if vision_override_track is not None:
+                safety_candidates.append(vision_override_track)
+
+            if safety_candidates:
+                # Let the most urgent fresh safety channel win. This prevents a
+                # rear obstacle from being hidden simply because a long-range
+                # front vision override also happens to be active.
+                selected = min(safety_candidates, key=lambda t: t.ttc())
+            else:
+                selected = (
+                    min(final_obstacles, key=lambda t: t.ttc())
+                    if final_obstacles else None
                 )
-            )
+
+            # Direction is attached to the ultrasonic source that selected the
+            # current safety obstacle. Rear is always BACK. Front uses the
+            # matched visual bbox zone, or FRONT when no bbox matches.
+            if selected is rear_ultrasonic_track:
+                selected_direction = "back"
+            elif selected is ultrasonic_track:
+                selected_direction = ultrasonic_direction or "front"
+            else:
+                selected_direction = None
 
             for tr in final_obstacles:
                 if tr.box is None:
@@ -3246,15 +3567,29 @@ def main():
             # GRU/proximity path above has ALREADY consumed its distance,
             # closing speed and class proxy. Keep the safety floor as an
             # additional guard, but do not overwrite those measurements.
+            # ---------------------------------------------------------
+            # DETERMINISTIC SAFETY AUDIO
+            # ---------------------------------------------------------
+            speech.request(
+                final_bucket,
+                selected,
+                w,
+                unknown_zone=unknown_zone,
+                forced_direction=selected_direction,
+            )
+
             selected_source = (
                 "VISION OVERRIDE"
                 if ultrasonic_vision_override_active
                 and vision_override_track is selected
                 else (
-                    "HC-SR04" if ultrasonic_track is selected
+                    "HC-SR04 FRONT" if ultrasonic_track is selected
                     else (
-                        "MiDaS UNKNOWN" if selected_is_unknown
-                        else ("YOLO" if selected is not None else "NONE")
+                        "HC-SR04 REAR" if rear_ultrasonic_track is selected
+                        else (
+                            "MiDaS UNKNOWN" if selected_is_unknown
+                            else ("YOLO" if selected is not None else "NONE")
+                        )
                     )
                 )
             )
@@ -3313,10 +3648,13 @@ def main():
                 if ultrasonic_vision_override_active
                 and vision_override_track is selected
                 else (
-                    "HC-SR04" if ultrasonic_track is selected
+                    "HC-SR04 FRONT" if ultrasonic_track is selected
                     else (
-                        "MiDaS UNKNOWN" if selected_is_unknown
-                        else ("YOLO" if selected is not None else "NONE")
+                        "HC-SR04 REAR" if rear_ultrasonic_track is selected
+                        else (
+                            "MiDaS UNKNOWN" if selected_is_unknown
+                            else ("YOLO" if selected is not None else "NONE")
+                        )
                     )
                 )
             )
@@ -3343,6 +3681,18 @@ def main():
                         else "Ultrasonic: -- cm (no recent reading)"
                     ),
                     (0, 255, 255), 0.50, 2,
+                ),
+                (
+                    (
+                        f"Rear ultrasonic: {rear_ultrasonic_distance_cm:.1f} cm (smoothed)"
+                        if rear_ultrasonic_distance_cm is not None
+                        else "Rear ultrasonic: -- cm (no recent reading)"
+                    ),
+                    (0, 255, 255), 0.50, 2,
+                ),
+                (
+                    f"Direction: {selected_direction or 'visual'}",
+                    (255, 255, 0), 0.48, 2,
                 ),
                 (
                     (
@@ -3382,10 +3732,13 @@ def main():
                             if ultrasonic_vision_override_active
                             and vision_override_track is selected
                             else (
-                                "Distance source: HC-SR04 (forward-axis YOLO object)"
-                                if ultrasonic_track is selected
-                                and getattr(ultrasonic_track, "source", "YOLO") == "YOLO"
-                                else "Distance source: HC-SR04 (independent obstacle)"
+                                "Distance source: HC-SR04 FRONT (matched visual bbox)"
+                                if ultrasonic_track is selected and front_ultrasonic_match is not None
+                                else (
+                                    "Distance source: HC-SR04 REAR"
+                                    if rear_ultrasonic_track is selected
+                                    else "Distance source: HC-SR04 FRONT (independent obstacle)"
+                                )
                             )
                         )
                         if ultrasonic_track is selected
@@ -3622,6 +3975,7 @@ def main():
         midas_worker.stop()
         reader.release()
         ultrasonic.stop()
+        speech.stop()
         cv2.destroyAllWindows()
 
 
