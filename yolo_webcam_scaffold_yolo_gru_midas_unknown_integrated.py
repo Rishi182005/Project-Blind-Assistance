@@ -119,23 +119,38 @@ class SpeechPlayback:
             self.wav_path = None
 
 
-def speech_friendly_units(message):
-    """Make spoken navigation units natural for Piper.
+def format_spoken_distance(distance):
+    """Format an internal distance in metres for spoken navigation.
 
-    Distances below 1 metre are spoken in centimetres. Distances of 1 metre
-    or more are spoken in metres rounded to one decimal place. Speed units
-    are expanded so Piper says "meters per second" instead of "m slash s".
+    Policy: distance < 1.0 m is converted to centimetres; distance >= 1.0 m
+    remains in metres. This is the single source of truth for all speech paths.
     """
+    distance = float(distance)
+    if distance < 1.0:
+        return f"{max(1, int(round(distance * 100.0)))} centimeters"
+    return f"{distance:.1f} meters"
+
+
+def speech_friendly_units(message):
+    """Normalize distance/speed units for Piper speech."""
     text = str(message)
 
-    def replace_distance(match):
-        value = float(match.group(1))
-        if value < 1.0:
-            return f"{round(value * 100):.0f} centimeters"
-        return f"{value:.1f} meters"
+    # Convert any explicit centimetre value to the same full spoken unit.
+    text = re.sub(
+        r"(?<![\w.])([0-9]+(?:\.[0-9]+)?)\s*(cm|centimeters?)\b",
+        lambda m: f"{max(1, int(round(float(m.group(1)))))} centimeters",
+        text,
+        flags=re.IGNORECASE,
+    )
 
-    # Handle both numeric forms commonly produced by the navigation prompt.
-    text = re.sub(r"(?<![\w.])([0-9]+(?:\.[0-9]+)?)\s*(?:m|meters?)\b", replace_distance, text, flags=re.IGNORECASE)
+    # Convert metre values according to the project speech policy.
+    text = re.sub(
+        r"(?<![\w.])([0-9]+(?:\.[0-9]+)?)\s*(m|meters?)\b",
+        lambda m: format_spoken_distance(float(m.group(1))),
+        text,
+        flags=re.IGNORECASE,
+    )
+
     text = re.sub(r"\bm\s*/\s*s\b", "meters per second", text, flags=re.IGNORECASE)
     text = re.sub(r"\bm/s\b", "meters per second", text, flags=re.IGNORECASE)
     return text
@@ -175,12 +190,20 @@ class SpeechManager:
 
     def __init__(self):
         # Only one pending item is useful. New scene snapshots replace stale ones.
-        self.queue = queue.Queue(maxsize=1)
+        self.queue = queue.Queue(maxsize=4)
+        self.pending_times = {}
+        self.max_pending_age_s = 3.5
         self.last_message = None
         self.ttc_alert_track = None
         self.ttc_alert_until = 0.0
         self.ttc_alert_last = 0.0
         self.ttc_alert_safe_since = 0.0
+        # Limit alerts for the same tracked object to at most two alerts.
+        # The counter is re-armed when the object becomes safe again.
+        self.object_alert_counts = {}
+        self.closing_speed_state = {}
+
+
         self.last_bucket = "LOW"
         self.last_direction = None
         self.last_spoken_time = 0.0
@@ -251,16 +274,19 @@ class SpeechManager:
 
     @classmethod
     def _should_interrupt(cls, old_item, new_item):
-        """Only a genuine increase in risk may interrupt current audio."""
+        """Only a CRITICAL/emergency warning may interrupt active speech.
+
+        Normal MEDIUM/HIGH/LOW messages are allowed to finish completely.
+        They remain queued for playback afterward, preventing Caution messages
+        from being cut off in the middle.
+        """
         if old_item is None:
             return True
         _om, old_bucket, _od, _old_dist, _old_ttc, _old_track = old_item
         _nm, new_bucket, _nd, _new_dist, _new_ttc, _new_track = new_item
         old_sev = cls._SEVERITY.get(str(old_bucket).upper(), 0)
         new_sev = cls._SEVERITY.get(str(new_bucket).upper(), 0)
-        # Same-risk warnings NEVER interrupt one another. Distance/TTC changes
-        # are handled by the repeat gate after the current sentence finishes.
-        return new_sev > old_sev
+        return new_sev >= cls._SEVERITY["CRITICAL"] and old_sev < cls._SEVERITY["CRITICAL"]
 
     @staticmethod
     def _stable_distance_change(old_distance, new_distance):
@@ -390,7 +416,7 @@ class SpeechManager:
                         self.active_playback = False
                         self.active_item = None
                         self.active_wav = None
-                    print("Speech: done")
+                    print("Speech: playback finished")
                     current_item = None
                     current_wav = None
                 else:
@@ -413,9 +439,15 @@ class SpeechManager:
                         current_item = None
                         current_wav = None
                     else:
-                        # The current sentence is still more urgent (or equally urgent).
-                        # Drop the new snapshot instead of replaying the same warning
-                        # immediately after the current sentence finishes.
+                        # Keep a distinct lower/equal-priority message pending.  Do not
+                        # discard it merely because the current sentence is still playing.
+                        # This is important for multi-object scenes: otherwise a curb,
+                        # person, or ultrasonic warning that arrived while another
+                        # sentence was playing could be silently lost.
+                        try:
+                            self.queue.put_nowait(newer)
+                        except queue.Full:
+                            pass
                         continue
 
             try:
@@ -457,10 +489,14 @@ class SpeechManager:
                     pass
                 continue
             elif newer is not None:
-                # Do not keep a stale/equal-risk snapshot waiting behind the
-                # sentence that was just synthesized. If it is not urgent
-                # enough to interrupt, it is intentionally discarded.
-                pass
+                # The new item is still useful even though it is not urgent enough
+                # to interrupt. Put it back so it can be spoken after the current
+                # sentence. Exact duplicate pending messages are filtered by
+                # _queue_latest().
+                try:
+                    self.queue.put_nowait(newer)
+                except queue.Full:
+                    pass
 
             try:
                 winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
@@ -551,24 +587,99 @@ class SpeechManager:
             self.last_bucket = bucket; self.last_direction = direction; self.last_message = item[0]
         self._queue_latest(item, log_prefix="Speech: queued")
 
+    def _stable_closing_speed(self, selected, raw_speed):
+        """Filter signed closing speed per tracked object.
+
+        Positive means approaching and negative means moving away. EMA filtering
+        reduces frame-to-frame sign flips, while a small deadband prevents
+        harmless jitter around zero from changing the motion state repeatedly.
+        """
+        track_key = getattr(selected, "track_id", id(selected))
+        now = time.monotonic()
+        state = self.closing_speed_state.get(track_key)
+
+        try:
+            raw_speed = float(raw_speed)
+        except (TypeError, ValueError):
+            raw_speed = 0.0
+
+        if state is None:
+            filtered = raw_speed
+        else:
+            filtered = (
+                CLOSING_SPEED_EMA_ALPHA * raw_speed
+                + (1.0 - CLOSING_SPEED_EMA_ALPHA) * state["speed"]
+            )
+
+        self.closing_speed_state[track_key] = {
+            "speed": filtered,
+            "time": now,
+        }
+
+        # Keep the sign stable around zero; don't call tiny noise
+        # "approaching" or "moving away".
+        if abs(filtered) < CLOSING_SPEED_SIGN_HYSTERESIS:
+            return 0.0
+        return filtered
+
     def request_ttc_alert(self, selected, frame_width, distance, closing_speed, ttc, direction=None):
         if not SPEECH_ENABLED or not self.running or selected is None:
             return False
+
+        # All internal navigation distances are metres and MAX_RANGE is 4 m.
+        # Guard against accidental centimetre values reaching this emergency
+        # speech path. Also handle the common case where an ultrasonic/vision
+        # value such as 0.88 m is represented correctly but an older caller has
+        # already converted it to 88 cm.
+        try:
+            distance = float(distance)
+
+            # Values above the configured metric range are almost certainly cm.
+            if distance > MAX_RANGE and distance <= (MAX_RANGE * 100.0):
+                distance /= 100.0
+
+            # Never allow an emergency speech message to announce a value
+            # outside the calibrated operating range.
+            distance = float(np.clip(distance, 0.0, MAX_RANGE))
+        except (TypeError, ValueError):
+            return False
+
         now = time.monotonic(); track_key = getattr(selected, "track_id", id(selected))
-        danger = closing_speed >= TTC_SPEECH_MIN_CLOSING_SPEED and ttc <= TTC_SPEECH_TRIGGER_S
+        alert_state = self.object_alert_counts.get(track_key, {"count": 0, "last": 0.0})
+        if alert_state["count"] >= TTC_MAX_ALERTS_PER_OBJECT:
+            return False
+        if now - alert_state["last"] < TTC_SAME_OBJECT_ALERT_INTERVAL_S:
+            return False
+        # TTC is meaningful only while the obstacle is approaching.
+        # Positive closing speed means distance is decreasing; zero/negative
+        # means stationary or moving away and therefore cannot trigger TTC.
+        approaching = float(closing_speed) > 0.0
+        danger = (
+            approaching
+            and closing_speed >= TTC_SPEECH_MIN_CLOSING_SPEED
+            and ttc <= TTC_SPEECH_TRIGGER_S
+        )
         if not danger:
             if ttc >= TTC_SPEECH_REARM_S or closing_speed <= 0:
                 if self.ttc_alert_safe_since <= 0.0: self.ttc_alert_safe_since = now
                 elif now - self.ttc_alert_safe_since >= TTC_SPEECH_REARM_STABLE_S:
                     self.ttc_alert_track = None; self.ttc_alert_until = 0.0; self.ttc_alert_safe_since = 0.0
+                    self.object_alert_counts.pop(track_key, None)
             else: self.ttc_alert_safe_since = 0.0
             return False
         self.ttc_alert_safe_since = 0.0
         if now - self.ttc_alert_last < TTC_SPEECH_COOLDOWN_S or (self.ttc_alert_track == track_key and now < self.ttc_alert_until):
             return False
         direction = direction or self._direction(selected, frame_width)
-        spoken_distance = f"{max(1, int(round(distance * 100.0)))} centimeters" if distance < 1.0 else f"{distance:.1f} meters"
-        text = (f"Stop. Fast approaching obstacle {spoken_distance} on your {direction}." if self.ttc_alert_track != track_key else f"Fast approaching obstacle {spoken_distance} on your {direction}.")
+
+        # Use the single project-wide speech distance policy.
+        spoken_distance = format_spoken_distance(distance)
+
+        text = (
+            f"Stop. Fast approaching obstacle {spoken_distance} on your {direction}."
+            if self.ttc_alert_track != track_key
+            else f"Fast approaching obstacle {spoken_distance} on your {direction}."
+        )
         item = (speech_friendly_units(text), "CRITICAL", direction, float(distance) if distance > 0 else None, float(ttc) if ttc > 0 else None, track_key)
         with self.lock:
             active_item = self.active_item; active = bool(self.active_playback)
@@ -579,6 +690,9 @@ class SpeechManager:
             print(f"Speech: interrupt -> {item[0]}")
             item = (self._transition_message(item[0]), item[1], item[2], item[3], item[4], item[5])
             self._cancel_active()
+        alert_state["count"] += 1
+        alert_state["last"] = now
+        self.object_alert_counts[track_key] = alert_state
         self.ttc_alert_track = track_key; self.ttc_alert_until = now + TTC_SPEECH_COOLDOWN_S
         self.ttc_alert_last = now; self.ttc_alert_safe_since = 0.0
         self._clear_queue(); self._queue_latest(item, log_prefix=f"Speech: TTC emergency -> {item[0]}")
@@ -587,6 +701,18 @@ class SpeechManager:
     def request_message(self, message, bucket, direction=None):
         if not SPEECH_ENABLED or not self.running:
             return
+        if bucket == "LOW":
+            # Low risk is not itself useful speech. State what the object is
+            # and how far away it is instead.
+            low_distance = self._message_distance(message)
+            if low_distance is not None:
+                message = re.sub(
+                    r"(?i)\b(?:low|low risk|risk\s*[:=]?\s*low)\b[\s:,-]*",
+                    "",
+                    str(message),
+                ).strip(" .,-")
+            # Do not invent an object label here; the normal Groq message is
+            # retained unless it explicitly contains a low-risk label.
         message = speech_friendly_units(str(message).strip())
         if not message:
             return
@@ -595,30 +721,74 @@ class SpeechManager:
         with self.lock:
             active_item = self.active_item; active = bool(self.active_playback)
         if active:
-            if not self._should_interrupt(active_item, item): return
-            if self._SEVERITY.get(bucket, 0) < self._SEVERITY.get(str(active_item[1]).upper(), 0): return
-            if time.monotonic() - self.last_interrupt_time < SPEECH_INTERRUPT_COOLDOWN_S: return
-            self.last_interrupt_time = time.monotonic()
-            print(f"Speech: interrupt -> {message}")
-            item = (self._transition_message(message), bucket, direction, distance, None, None)
-            self._cancel_active()
+            # Do not cut off an ordinary sentence. Only a CRITICAL/emergency
+            # message is permitted to interrupt active playback. MEDIUM Caution
+            # and HIGH warnings are queued and spoken in full afterward.
+            if self._should_interrupt(active_item, item):
+                if time.monotonic() - self.last_interrupt_time < SPEECH_INTERRUPT_COOLDOWN_S:
+                    return
+                self.last_interrupt_time = time.monotonic()
+                print(f"Speech: interrupt -> {message}")
+                item = (self._transition_message(message), bucket, direction, distance, None, None)
+                self._cancel_active()
+            else:
+                # It is still a valid new warning; leave it pending instead of
+                # dropping it merely because another sentence is playing.
+                pass
         elif not self._allow_stable_repeat(item):
             return
         self._queue_latest(item, log_prefix="Speech: LLM queued")
 
     def _clear_queue(self):
         try:
-            while True:
-                self.queue.get_nowait()
-        except queue.Empty:
-            pass
+            with self.queue.mutex:
+                self.queue.queue.clear()
+                self.queue.unfinished_tasks = 0
+                self.pending_times.clear()
+        except Exception:
+            self.pending_times.clear()
 
     def _queue_latest(self, item, log_prefix="Speech: queued"):
-        self._clear_queue()
+        """Keep speech responsive by bounding and aging the pending queue."""
         try:
-            self.queue.put_nowait(item)
+            now = time.monotonic()
+            with self.queue.mutex:
+                existing_items = list(self.queue.queue)
+                if any(existing[0] == item[0] for existing in existing_items):
+                    return
+
+                kept = []
+                for existing in existing_items:
+                    queued_at = self.pending_times.get(existing[0], now)
+                    age = now - queued_at
+                    sev = self._SEVERITY.get(str(existing[1]).upper(), 0)
+                    if sev < self._SEVERITY["CRITICAL"] and age > self.max_pending_age_s:
+                        self.pending_times.pop(existing[0], None)
+                        print(f"Speech: dropped stale pending -> {existing[0]}")
+                        continue
+                    kept.append(existing)
+                self.queue.queue.clear()
+                self.queue.queue.extend(kept)
+
+                if len(self.queue.queue) >= self.queue.maxsize:
+                    removable = None
+                    for idx, existing in enumerate(self.queue.queue):
+                        if str(existing[1]).upper() != "CRITICAL":
+                            removable = idx
+                            break
+                    if removable is None:
+                        return
+                    dropped = self.queue.queue[removable]
+                    del self.queue.queue[removable]
+                    self.pending_times.pop(dropped[0], None)
+                    print(f"Speech: dropped pending -> {dropped[0]}")
+
+                self.queue.queue.append(item)
+                self.pending_times[item[0]] = now
+                self.queue.unfinished_tasks += 1
+                self.queue.not_empty.notify()
             print(f"{log_prefix} -> {item[0]}")
-        except queue.Full:
+        except Exception:
             pass
 
     def deterministic_fallback_message(self, bucket, direction):
@@ -720,11 +890,7 @@ class GroqNavigationManager:
 
     @staticmethod
     def _approach_state(closing_speed):
-        if closing_speed > 0.08:
-            return "approaching"
-        if closing_speed < -0.08:
-            return "moving away"
-        return "stationary"
+        return closing_motion_state(closing_speed)
 
     def _make_context(self, bucket, obj_name, distance, direction, closing_speed, ttc):
         return {
@@ -778,6 +944,13 @@ class GroqNavigationManager:
             if abs(ctx["distance"] - previous["distance"]) >= GROQ_DISTANCE_EVENT_M:
                 return True
 
+        # Movement-state changes are meaningful even when risk bucket and
+        # distance have not changed enough to trigger another event. This is
+        # important because the spoken message must explicitly say "moving
+        # away" when the signed closing speed is negative.
+        if ctx["approach_state"] != previous["approach_state"]:
+            return True
+
         # Severity decrease / normal approach-state jitter: stay silent.
         self.bucket_change_candidate = None
         self.bucket_change_start = None
@@ -827,7 +1000,7 @@ class GroqNavigationManager:
 Give ONE short spoken instruction, maximum 18 words.
 Use ONLY the supplied facts. Never invent an obstacle, distance, direction, movement, or safe escape route.
 Never tell the user to turn left/right, step back, or choose an escape route unless that safe route is explicitly supplied.
-Always include distance and direction when available. If approaching, say it is approaching.
+Always include distance and direction when available. Movement wording MUST match Closing speed: positive = approaching, negative = moving away. NEVER call a moving-away object approaching. If the closing speed is near zero, do NOT mention stationary or any movement state; simply describe the object, distance, direction, and required risk instruction.
 For distance in your spoken instruction, use centimetres below 1 metre (for example, 49 cm), and metres rounded to one decimal place at 1 metre or more (for example, 1.4 meters).
 Write speed units as "meters per second", never "m/s".
 CRITICAL: start with Stop and tell the user not to move forward.
@@ -851,7 +1024,30 @@ Risk: {ctx['bucket']}
             max_tokens=GROQ_MAX_TOKENS,
             reasoning_effort="none",
         )
-        return response.choices[0].message.content.strip()
+        text = response.choices[0].message.content.strip()
+        # Enforce the signed motion state after the LLM response so a negative
+        # closing speed can never be described as approaching.
+        state = self._approach_state(ctx["closing_speed"])
+        if state == "moving away":
+            # Do not rely on the LLM to volunteer the movement state. If the
+            # signed speed is negative, enforce the phrase in the final text.
+            text = re.sub(r"\bapproaching\b", "moving away", text, flags=re.IGNORECASE)
+            text = re.sub(r"\bclosing\b", "moving away", text, flags=re.IGNORECASE)
+            if not re.search(r"\bmoving away\b", text, flags=re.IGNORECASE):
+                speed = abs(float(ctx["closing_speed"]))
+                speed_spoken = (
+                    f"{speed * 100.0:.0f} centimeters per second"
+                    if speed < 1.0 else f"{speed:.2f} meters per second"
+                )
+                text = text.rstrip(" .") + f", moving away at {speed_spoken}."
+        elif state == "stationary":
+            # Stationary is the implicit/default state. Do not make the user
+            # listen to an unnecessary movement label. Remove common movement
+            # phrases while preserving the useful object/distance/direction text.
+            text = re.sub(r",?\s*(?:which is |that is )?(?:currently )?(?:stationary|not moving)\b", "", text, flags=re.IGNORECASE)
+            text = re.sub(r",?\s*(?:currently )?(?:approaching|closing|moving away)\b(?:\s+at\s+[-+]?\d+(?:\.\d+)?\s*(?:meters?|centimeters?)\s+per\s+second)?", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s{2,}", " ", text).strip()
+        return text
 
     def _worker(self):
         while self.running:
@@ -1376,6 +1572,13 @@ TTC_SPEECH_TRIGGER_S = 1.50
 TTC_SPEECH_REARM_S = 2.50
 TTC_SPEECH_MIN_CLOSING_SPEED = 0.12
 TTC_SPEECH_COOLDOWN_S = 2.50
+CLOSING_SPEED_EMA_ALPHA = 0.20
+CLOSING_SPEED_SIGN_HYSTERESIS = 0.08
+CLOSING_SPEED_MIN_DT = 0.03
+
+TTC_MAX_ALERTS_PER_OBJECT = 2
+TTC_SAME_OBJECT_ALERT_INTERVAL_S = 5.0
+
 TTC_SPEECH_REARM_STABLE_S = 1.00
 UNKNOWN_REPLACEMENT_MARGIN_M = 0.15           # TTC assigned when an object isn't closing
 
@@ -1984,6 +2187,22 @@ def current_yolo_anchor_distance(track, frame_area):
         / max(float(frame_area), 1.0)
     )
     return bbox_area_to_distance(area_frac)
+
+
+def closing_motion_state(closing_speed):
+    """Classify obstacle motion using the signed closing speed.
+
+    Sign convention used throughout the live system:
+      > 0 m/s  = obstacle is getting closer  -> increasing collision risk
+      < 0 m/s  = obstacle is moving farther  -> minimum predictive risk
+      ~= 0 m/s = obstacle is stationary      -> distance/proximity determines risk
+    """
+    speed = float(closing_speed)
+    if speed > SPEED_DEADBAND:
+        return "approaching"
+    if speed < -SPEED_DEADBAND:
+        return "moving away"
+    return "stationary"
 
 
 def risk_bucket(risk):
@@ -3827,7 +4046,7 @@ def main():
                 created_virtual = track is None
                 if created_virtual:
                     track = Track(
-                        f"{label} ultrasonic obstacle",
+                        "unknown object",
                         (w / 2.0, h * 0.70),
                         distance_m,
                         now,
@@ -3852,7 +4071,7 @@ def main():
                 if created_virtual:
                     track.box = None
                     track.centroid = (w / 2.0, h * 0.70)
-                    track.cls_name = f"{label.lower()} ultrasonic obstacle"
+                    track.cls_name = "unknown object"
                 track.last_yolo_distance = distance_m
                 track.last_midas_ratio = 1.0
                 track.last_midas_correction = 1.0
@@ -3900,7 +4119,7 @@ def main():
                     ultrasonic_track = ultrasonic_virtual_track
                     if ultrasonic_track is None:
                         ultrasonic_track = Track(
-                            "front ultrasonic obstacle",
+                            "unknown object",
                             (w / 2.0, h * 0.70),
                             front_m,
                             now,
@@ -4156,6 +4375,11 @@ def main():
                 gru_cls_name
             )
 
+            motion_state = closing_motion_state(closing_speed)
+
+            # Preserve the signed closing-speed feature for the GRU:
+            # positive = approaching, negative = moving away.
+            # A moving-away object is therefore minimum predictive risk.
             feature_vec = [
                 dist / MAX_RANGE,
                 closing_speed,
@@ -4198,12 +4422,68 @@ def main():
                 )
             )
 
-            final_risk, final_bucket = (
-                combine_risk(
-                    live_risk,
-                    proximity_level,
+            # Motion direction modifies risk; it does not replace distance.
+            # A moving-away object is safer than an equally-close approaching
+            # object, but a very close object must still be treated cautiously.
+            if motion_state == "moving away":
+                # proximity_level is a bucket string (LOW/MEDIUM/HIGH/CRITICAL),
+                # not a numeric score. Convert it through the same bucket
+                # ranking used elsewhere rather than casting the string.
+                proximity_rank = {
+                    "LOW": 0,
+                    "MEDIUM": 1,
+                    "HIGH": 2,
+                    "CRITICAL": 3,
+                }
+                live_rank = proximity_rank.get(
+                    risk_bucket(live_risk), 0
                 )
-            )
+                proximity_rank_value = proximity_rank.get(
+                    str(proximity_level).upper(), 0
+                )
+
+                # Moving away reduces predictive risk by one severity level,
+                # but distance/proximity is still retained. Thus a very close
+                # obstacle cannot become LOW simply because it is receding.
+                combined_rank = max(live_rank, proximity_rank_value)
+                relieved_rank = max(0, combined_rank - 1)
+
+                if dist <= 0.75:
+                    relieved_rank = max(relieved_rank, 2)
+                elif dist <= 1.25:
+                    relieved_rank = max(relieved_rank, 1)
+
+                rank_to_bucket = {
+                    0: "LOW",
+                    1: "MEDIUM",
+                    2: "HIGH",
+                    3: "CRITICAL",
+                }
+                final_bucket = rank_to_bucket[relieved_rank]
+
+                # Keep the continuous risk consistent with the selected bucket.
+                bucket_floor = {
+                    "LOW": 0.0,
+                    "MEDIUM": LOW_MED_BOUNDARY,
+                    "HIGH": MED_HIGH_BOUNDARY,
+                    "CRITICAL": 0.95,
+                }[final_bucket]
+                final_risk = max(
+                    bucket_floor,
+                    min(float(live_risk), 0.999)
+                )
+
+                proximity_reason = (
+                    f"moving away ({closing_speed:+.2f} m/s); "
+                    f"distance {dist:.2f} m still considered"
+                )
+            else:
+                final_risk, final_bucket = (
+                    combine_risk(
+                        live_risk,
+                        proximity_level,
+                    )
+                )
 
             # ---------------------------------------------------------
             # MiDaS unknown-obstacle safety layer
@@ -4441,7 +4721,7 @@ def main():
                     (255, 255, 0), 0.44, 1,
                 ),
                 (
-                    f"Closing: {closing_speed:+.2f} m/s | TTC: {selected_ttc:.1f} s",
+                    f"Closing: {closing_speed:+.2f} m/s ({closing_motion_state(closing_speed)}) | TTC: {selected_ttc:.1f} s",
                     (0, 90, 255), 0.50, 2,
                 ),
                 (
