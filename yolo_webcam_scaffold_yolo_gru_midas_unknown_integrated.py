@@ -156,32 +156,146 @@ def speech_friendly_units(message):
     return text
 
 
-def _piper_synthesis_worker(request_queue, result_queue, model_file, length_scale):
-    """Persistent Piper worker process. Keeps neural TTS CPU work off the video process."""
+def _configure_sapi_process():
+    """Keep SAPI speech below the priority of the vision application."""
+    if os.name != "nt":
+        return
     try:
-        from piper import PiperVoice, SynthesisConfig
-        voice = PiperVoice.load(str(Path(model_file)))
-        synth_config = SynthesisConfig(length_scale=length_scale)
-        result_queue.put(("READY", None))
-    except Exception as exc:
-        result_queue.put(("ERROR", str(exc)))
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetCurrentProcess()
+        # BELOW_NORMAL_PRIORITY_CLASS
+        kernel32.SetPriorityClass(handle, 0x00004000)
+    except Exception:
+        pass
+
+
+def _sapi_worker(request_queue, result_queue, voice_name, rate, volume):
+    """Dedicated Windows SAPI worker; no neural TTS model or WAV synthesis."""
+    _configure_sapi_process()
+
+    if os.name != "nt":
+        result_queue.put(("ERROR", "Windows SAPI requires Windows."))
         return
 
-    while True:
-        item = request_queue.get()
-        if item is None:
-            break
-        message, wav_path = item
-        try:
-            import wave
-            with wave.open(wav_path, "wb") as wav_file:
-                voice.synthesize_wav(str(message), wav_file, syn_config=synth_config)
-            with wave.open(wav_path, "rb") as wav_file:
-                duration_s = wav_file.getnframes() / float(max(wav_file.getframerate(), 1))
-            result_queue.put(("OK", wav_path, duration_s))
-        except Exception as exc:
-            result_queue.put(("ERROR", str(exc)))
+    pythoncom = None
+    try:
+        import pythoncom
+        import win32com.client
+        import time as _time
 
+        pythoncom.CoInitialize()
+        speaker = win32com.client.Dispatch("SAPI.SpVoice")
+
+        # Best-effort voice selection.
+        try:
+            voices = speaker.GetVoices()
+            for i in range(voices.Count):
+                voice = voices.Item(i)
+                description = str(voice.GetDescription())
+                if voice_name.lower() in description.lower():
+                    speaker.Voice = voice
+                    break
+        except Exception:
+            pass
+
+        try:
+            speaker.Rate = int(rate)
+        except Exception:
+            pass
+        try:
+            speaker.Volume = max(0, min(100, int(volume)))
+        except Exception:
+            pass
+
+        SVSFlagsAsync = 1
+        SVSFPurgeBeforeSpeak = 2
+
+        result_queue.put(("READY", None))
+
+        speaking = False
+        while True:
+            # While speaking, only a STOP command is acted upon.
+            if speaking:
+                try:
+                    event = request_queue.get_nowait()
+                except Exception:
+                    event = None
+
+                if event is not None:
+                    if event[0] == "STOP":
+                        try:
+                            speaker.Speak("", SVSFPurgeBeforeSpeak)
+                        except Exception:
+                            pass
+                        speaking = False
+                        result_queue.put(("STOPPED", None))
+                        continue
+                    # Drop stale SPEAK requests; SpeechManager keeps the latest
+                    # item in its own queue.
+
+                try:
+                    running = int(speaker.Status.RunningState) == 2
+                except Exception:
+                    running = False
+
+                if not running:
+                    speaking = False
+                    result_queue.put(("DONE", None))
+
+                _time.sleep(0.002)
+                continue
+
+            item = request_queue.get()
+            if item is None:
+                break
+
+            if item[0] == "STOP":
+                continue
+
+            if item[0] != "SPEAK":
+                continue
+
+            message = str(item[1])
+            try:
+                speaker.Speak(message, SVSFlagsAsync)
+                speaking = True
+                result_queue.put(("STARTED", message))
+            except Exception as exc:
+                result_queue.put(("ERROR", f"SAPI playback: {type(exc).__name__}: {exc}"))
+
+    except Exception as exc:
+        result_queue.put(("ERROR", f"SAPI startup: {type(exc).__name__}: {exc}"))
+    finally:
+        try:
+            if pythoncom is not None:
+                pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+class DisplayThrottler:
+    """Throttle UI refresh slightly, but NEVER pause video because of TTS."""
+    def __init__(self):
+        self.last_display_time = 0.0
+        self.min_display_interval = 0.016  # ~60 FPS cap
+
+    def set_tts_active(self, active):
+        """Compatibility hook. TTS state must never suppress the live video."""
+        return None
+
+    def should_display(self):
+        """Check if enough time has passed since last display."""
+        now = time.monotonic()
+        if now - self.last_display_time < self.min_display_interval:
+            return False
+        self.last_display_time = now
+        return True
+
+    def do_display(self, window_name, frame):
+        """Always display the newest frame; speech runs independently."""
+        if self.should_display():
+            safe_imshow(window_name, frame)
 
 class SpeechManager:
     """Speech arbitration with persistent Piper and urgency-aware interruption."""
@@ -219,21 +333,22 @@ class SpeechManager:
         self.repeat_state = {}
         self.last_interrupt_time = 0.0
 
-        # Keep Piper loaded once. This removes the 6-7 second per-utterance model-load delay.
-        self.piper_request_queue = mp.Queue(maxsize=1)
-        self.piper_result_queue = mp.Queue()
-        self.piper_process = mp.Process(
-            target=_piper_synthesis_worker,
+        # Windows SAPI runs in a dedicated low-priority process.
+        self.sapi_request_queue = mp.Queue(maxsize=1)
+        self.sapi_result_queue = mp.Queue()
+        self.sapi_process = mp.Process(
+            target=_sapi_worker,
             args=(
-                self.piper_request_queue,
-                self.piper_result_queue,
-                PIPER_MODEL_FILE,
-                PIPER_LENGTH_SCALE,
+                self.sapi_request_queue,
+                self.sapi_result_queue,
+                "Microsoft Zira",
+                0,
+                100,
             ),
             daemon=True,
         )
-        self.piper_process.start()
-        print(f"Speech: persistent Piper mode | model={PIPER_MODEL_FILE} | length_scale={PIPER_LENGTH_SCALE}")
+        self.sapi_process.start()
+        print("Speech: Windows SAPI mode | neural TTS disabled | target voice=Microsoft Zira")
 
         self.thread = threading.Thread(target=self._worker, name="SpeechWorker", daemon=True)
         self.thread.start()
@@ -250,15 +365,32 @@ class SpeechManager:
         unit = match.group(0).lower()
         return value / 100.0 if ("cm" in unit or "centimeter" in unit) else value
 
-    @staticmethod
-    def _transition_message(message):
+    def _transition_message(self, message):
+        """Add a varied, concise emergency lead-in; never use 'Pardon'."""
         text = str(message).strip()
         if not text:
             return text
-        # A short transition word makes an interruption audible as a change of state.
-        if not re.match(r"^(pardon|wait|attention)[,.!? ]", text, re.IGNORECASE):
-            return f"Pardon. {text}"
-        return text
+
+        # Only add a transition when the new message does not already have one.
+        if re.match(
+            r"^(stop|stop now|hold|do not advance|urgent|immediate danger|careful)[,.!? ]",
+            text,
+            re.IGNORECASE,
+        ):
+            return text
+
+        leads = (
+            "Stop now. ",
+            "Hold. ",
+            "Do not advance. ",
+            "Immediate danger. ",
+            "Careful. ",
+        )
+
+        # Use the current time only to rotate wording; never changes the
+        # underlying safety content.
+        index = int(time.monotonic() * 10) % len(leads)
+        return f"{leads[index]}{text}"
 
     @classmethod
     def _urgency_score(cls, item):
@@ -274,19 +406,49 @@ class SpeechManager:
 
     @classmethod
     def _should_interrupt(cls, old_item, new_item):
-        """Only a CRITICAL/emergency warning may interrupt active speech.
-
-        Normal MEDIUM/HIGH/LOW messages are allowed to finish completely.
-        They remain queued for playback afterward, preventing Caution messages
-        from being cut off in the middle.
-        """
+        """Interrupt stale speech when the new hazard is meaningfully more urgent."""
         if old_item is None:
             return True
-        _om, old_bucket, _od, _old_dist, _old_ttc, _old_track = old_item
-        _nm, new_bucket, _nd, _new_dist, _new_ttc, _new_track = new_item
+
+        _om, old_bucket, _od, old_dist, old_ttc, _old_track = old_item
+        _nm, new_bucket, _nd, new_dist, new_ttc, _new_track = new_item
+
         old_sev = cls._SEVERITY.get(str(old_bucket).upper(), 0)
         new_sev = cls._SEVERITY.get(str(new_bucket).upper(), 0)
-        return new_sev >= cls._SEVERITY["CRITICAL"] and old_sev < cls._SEVERITY["CRITICAL"]
+
+        # Emergency always wins.
+        if new_sev >= cls._SEVERITY["CRITICAL"]:
+            return True
+
+        # A new HIGH warning should not wait behind a LOW/MEDIUM sentence.
+        if new_sev == cls._SEVERITY["HIGH"] and old_sev < cls._SEVERITY["HIGH"]:
+            return True
+
+        # A MEDIUM warning can replace a LOW narration.
+        if new_sev == cls._SEVERITY["MEDIUM"] and old_sev < cls._SEVERITY["MEDIUM"]:
+            return True
+
+        # While already at the same severity, interrupt only when the new
+        # obstacle is materially closer or TTC is materially worse.
+        if new_sev == old_sev and new_sev >= cls._SEVERITY["HIGH"]:
+            try:
+                if (
+                    old_dist is not None and new_dist is not None
+                    and float(new_dist) < float(old_dist) - 0.15
+                ):
+                    return True
+            except Exception:
+                pass
+            try:
+                if (
+                    old_ttc is not None and new_ttc is not None
+                    and float(new_ttc) < float(old_ttc) - 0.5
+                ):
+                    return True
+            except Exception:
+                pass
+
+        return False
 
     @staticmethod
     def _stable_distance_change(old_distance, new_distance):
@@ -329,199 +491,115 @@ class SpeechManager:
         self.repeat_state.clear()
 
     def _synthesize(self, message):
-        """Synthesize with the already-loaded Piper process and return WAV path/duration."""
-        fd, wav_path = tempfile.mkstemp(prefix="wearable_piper_", suffix=".wav")
-        os.close(fd)
+        """Start SAPI speech asynchronously; return immediately."""
         try:
-            # Keep the synthesis queue at one item and drain stale results first.
-            while True:
-                try:
-                    self.piper_result_queue.get_nowait()
-                except queue.Empty:
-                    break
-                except Exception:
-                    break
-            try:
-                self.piper_request_queue.put((speech_friendly_units(message), wav_path), timeout=0.2)
-            except Exception:
-                os.remove(wav_path)
-                return None
-
-            deadline = time.monotonic() + 15.0
-            while time.monotonic() < deadline and self.running:
-                try:
-                    result = self.piper_result_queue.get(timeout=0.05)
-                except queue.Empty:
-                    continue
-                if not result:
-                    continue
-                if result[0] == "OK":
-                    return result[1], float(result[2])
-                if result[0] == "ERROR":
-                    print(f"Speech ERROR: Piper: {result[1]}")
-                    break
-            try:
-                os.remove(wav_path)
-            except OSError:
-                pass
-            return None
+            self.sapi_request_queue.put_nowait(
+                ("SPEAK", speech_friendly_units(message))
+            )
+            return True
         except Exception as exc:
-            print(f"Speech ERROR: synthesis: {type(exc).__name__}: {exc!r}")
-            try:
-                os.remove(wav_path)
-            except OSError:
-                pass
-            return None
+            print(f"Speech ERROR: SAPI request: {type(exc).__name__}: {exc}")
+            return False
 
     def _cancel_active(self):
-        """Stop current playback immediately; do not stop normal speech unless an urgent item wins."""
+        """Stop SAPI playback without blocking the main vision process."""
         with self.lock:
             was_active = bool(self.active_playback)
-            wav_path = self.active_wav
             self.active_playback = False
             self.active_item = None
-            self.active_wav = None
-        if was_active and os.name == "nt":
+
+        if was_active:
             try:
-                winsound.PlaySound(None, winsound.SND_PURGE)
+                # Remove stale pending SAPI commands first.
+                while True:
+                    try:
+                        self.sapi_request_queue.get_nowait()
+                    except Exception:
+                        break
+                try:
+                    self.sapi_request_queue.put_nowait(("STOP",))
+                except Exception:
+                    pass
             except Exception:
-                pass
-        if wav_path:
-            try:
-                os.remove(wav_path)
-            except OSError:
                 pass
         return was_active
 
     def _worker(self):
-        current_item = None
-        current_wav = None
-        playback_end = 0.0
-
+        """Low-latency speech arbitration; never churn the pending queue."""
         while self.running:
-            # Finish/cancel current playback without blocking the speech thread.
-            if current_item is not None:
-                if time.monotonic() >= playback_end:
-                    try:
-                        if os.name == "nt":
-                            winsound.PlaySound(None, winsound.SND_PURGE)
-                    except Exception:
-                        pass
-                    if current_wav:
-                        try:
-                            os.remove(current_wav)
-                        except OSError:
-                            pass
+            # Drain SAPI state notifications.
+            while True:
+                try:
+                    result = self.sapi_result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
+
+                if not result:
+                    continue
+
+                kind = result[0]
+                if kind == "READY":
+                    continue
+
+                if kind == "STARTED":
+                    message = result[1]
+                    with self.lock:
+                        self.active_playback = True
+                    print(f"Speech: speaking -> {message}")
+
+                elif kind in ("DONE", "STOPPED"):
                     with self.lock:
                         self.active_playback = False
                         self.active_item = None
-                        self.active_wav = None
                     print("Speech: playback finished")
-                    current_item = None
-                    current_wav = None
-                else:
-                    try:
-                        newer = self.queue.get(timeout=0.05)
-                    except queue.Empty:
-                        continue
-                    if newer is None:
-                        self.running = False
-                        self._cancel_active()
-                        break
-                    if self._should_interrupt(current_item, newer):
-                        print(f"Speech: interrupt -> {newer[0]}")
-                        self._cancel_active()
-                        # Mark the transition explicitly in the spoken sentence.
-                        newer = (
-                            self._transition_message(newer[0]),
-                            newer[1], newer[2], newer[3], newer[4], newer[5],
-                        )
-                        current_item = None
-                        current_wav = None
-                    else:
-                        # Keep a distinct lower/equal-priority message pending.  Do not
-                        # discard it merely because the current sentence is still playing.
-                        # This is important for multi-object scenes: otherwise a curb,
-                        # person, or ultrasonic warning that arrived while another
-                        # sentence was playing could be silently lost.
-                        try:
-                            self.queue.put_nowait(newer)
-                        except queue.Full:
-                            pass
-                        continue
 
+                elif kind == "ERROR":
+                    print(f"Speech ERROR: {result[1]}")
+                    with self.lock:
+                        self.active_playback = False
+                        self.active_item = None
+
+            # If a sentence is playing, do not touch the pending queue.
+            # This eliminates the dequeue/requeue latency that was allowing
+            # warnings to drift several messages behind the live scene.
+            with self.lock:
+                active = bool(self.active_playback)
+                active_item = self.active_item
+
+            if active or active_item is not None:
+                time.sleep(0.005)
+                continue
+
+            # No active speech: immediately take the freshest queued message.
             try:
-                item = self.queue.get(timeout=0.1)
+                item = self.queue.get(timeout=0.005)
             except queue.Empty:
                 continue
+
             if item is None:
                 break
 
-            message, bucket, direction, distance, ttc, track_key = item
-            result = self._synthesize(message)
-            if result is None:
-                continue
-            wav_path, duration_s = result
-            if not self.running:
-                try:
-                    os.remove(wav_path)
-                except OSError:
-                    pass
-                break
+            self.pending_times.pop(item[0], None)
 
-            # It is possible for an urgent request to have arrived during synthesis.
-            try:
-                newer = self.queue.get_nowait()
-            except queue.Empty:
-                newer = None
-            if newer is not None and self._should_interrupt(item, newer):
-                try:
-                    os.remove(wav_path)
-                except OSError:
-                    pass
-                newer = (
-                    self._transition_message(newer[0]),
-                    newer[1], newer[2], newer[3], newer[4], newer[5],
-                )
-                try:
-                    self.queue.put_nowait(newer)
-                except queue.Full:
-                    pass
-                continue
-            elif newer is not None:
-                # The new item is still useful even though it is not urgent enough
-                # to interrupt. Put it back so it can be spoken after the current
-                # sentence. Exact duplicate pending messages are filtered by
-                # _queue_latest().
-                try:
-                    self.queue.put_nowait(newer)
-                except queue.Full:
-                    pass
-
-            try:
-                winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-                current_item = item
-                current_wav = wav_path
-                playback_end = time.monotonic() + max(duration_s, 0.05) + 0.05
+            message = str(item[0])
+            if self._synthesize(message):
                 with self.lock:
-                    self.active_playback = True
                     self.active_item = item
-                    self.active_wav = wav_path
-                    self.last_spoken_time = time.monotonic()
-                print(f"Speech: speaking -> {message}")
-            except Exception as exc:
-                print(f"Speech ERROR: playback: {type(exc).__name__}: {exc!r}")
-                try:
-                    os.remove(wav_path)
-                except OSError:
-                    pass
+            else:
+                with self.lock:
+                    self.active_item = None
 
     def _direction(self, selected, frame_width, unknown_zone=""):
         if selected is None:
             return "ahead"
         box = getattr(selected, "box", None)
         if box is None:
-            return "behind" if str(getattr(selected, "source", "")).upper() == "HC-SR04-REAR" else "ahead"
+            source = str(getattr(selected, "source", "")).upper()
+            if "REAR" in source or "BACK" in source:
+                return "back"
+            return "front"
         cx = (float(box[0]) + float(box[2])) / 2.0
         if cx < frame_width * 0.33:
             side = "left"
@@ -545,12 +623,19 @@ class SpeechManager:
         if bucket not in self._SEVERITY:
             return
         direction = forced_direction or self._direction(selected, frame_width, unknown_zone)
+        # Never speak an invalid/unknown direction. If a caller supplies a
+        # placeholder such as None or "none", derive the direction from the
+        # selected object/sensor instead.
+        if str(direction).strip().lower() in {"", "none", "null", "unknown", "nan"}:
+            direction = self._direction(selected, frame_width, unknown_zone)
+        if str(direction).strip().lower() in {"", "none", "null", "unknown", "nan"}:
+            direction = "ahead"
         now = time.monotonic()
         if direction != self.direction_candidate:
             self.direction_candidate = direction; self.direction_candidate_since = now
         elif now - self.direction_candidate_since < SPEECH_DIRECTION_STABLE_S and bucket == self.last_bucket:
             return
-        message = (f"Stop. Critical obstacle on your {direction}." if bucket == "CRITICAL" else f"Stop. Obstacle on your {direction}." if bucket == "HIGH" else f"Caution. Obstacle on your {direction}.")
+        message = self.deterministic_fallback_message(bucket, direction)
         distance = None; ttc = None; track_key = None
         if selected is not None:
             track_key = getattr(selected, "track_id", id(selected))
@@ -571,7 +656,8 @@ class SpeechManager:
             if self.ttc_alert_track == track_key and now < self.ttc_alert_until:
                 return
         with self.lock:
-            active_item = self.active_item; active = bool(self.active_playback)
+            active_item = self.active_item
+            active = bool(self.active_playback or active_item is not None)
         if active:
             if not self._should_interrupt(active_item, item):
                 return
@@ -671,15 +757,22 @@ class SpeechManager:
         if now - self.ttc_alert_last < TTC_SPEECH_COOLDOWN_S or (self.ttc_alert_track == track_key and now < self.ttc_alert_until):
             return False
         direction = direction or self._direction(selected, frame_width)
+        if str(direction).strip().lower() in {"", "none", "null", "unknown", "nan"}:
+            direction = self._direction(selected, frame_width)
+        if str(direction).strip().lower() in {"", "none", "null", "unknown", "nan"}:
+            direction = "ahead"
 
         # Use the single project-wide speech distance policy.
         spoken_distance = format_spoken_distance(distance)
 
-        text = (
-            f"Stop. Fast approaching obstacle {spoken_distance} on your {direction}."
-            if self.ttc_alert_track != track_key
-            else f"Fast approaching obstacle {spoken_distance} on your {direction}."
+        ttc_options = (
+            f"Stop. Fast approaching obstacle {spoken_distance} on your {direction}.",
+            f"Immediate danger. Obstacle {spoken_distance} on your {direction}, closing fast.",
+            f"Do not advance. Fast-moving obstacle {spoken_distance} on your {direction}.",
+            f"Hold position. Collision risk {spoken_distance} on your {direction}.",
         )
+        ttc_index = (int(time.monotonic() * 10) + (track_key or 0)) % len(ttc_options)
+        text = ttc_options[ttc_index]
         item = (speech_friendly_units(text), "CRITICAL", direction, float(distance) if distance > 0 else None, float(ttc) if ttc > 0 else None, track_key)
         with self.lock:
             active_item = self.active_item; active = bool(self.active_playback)
@@ -749,57 +842,85 @@ class SpeechManager:
             self.pending_times.clear()
 
     def _queue_latest(self, item, log_prefix="Speech: queued"):
-        """Keep speech responsive by bounding and aging the pending queue."""
+        """Keep only the freshest useful warning waiting for speech."""
         try:
             now = time.monotonic()
+            new_sev = self._SEVERITY.get(str(item[1]).upper(), 0)
+
             with self.queue.mutex:
-                existing_items = list(self.queue.queue)
-                if any(existing[0] == item[0] for existing in existing_items):
+                existing = list(self.queue.queue)
+
+                if any(old[0] == item[0] for old in existing):
                     return
 
+                # CRITICAL alerts are preserved. For ordinary messages, remove
+                # older non-critical items so stale warnings cannot build up.
                 kept = []
-                for existing in existing_items:
-                    queued_at = self.pending_times.get(existing[0], now)
-                    age = now - queued_at
-                    sev = self._SEVERITY.get(str(existing[1]).upper(), 0)
-                    if sev < self._SEVERITY["CRITICAL"] and age > self.max_pending_age_s:
-                        self.pending_times.pop(existing[0], None)
-                        print(f"Speech: dropped stale pending -> {existing[0]}")
-                        continue
-                    kept.append(existing)
+                if new_sev >= self._SEVERITY["CRITICAL"]:
+                    for old in existing:
+                        if str(old[1]).upper() == "CRITICAL":
+                            kept.append(old)
+                else:
+                    # Keep at most one existing CRITICAL; otherwise keep none.
+                    for old in existing:
+                        if str(old[1]).upper() == "CRITICAL":
+                            kept.append(old)
+                            break
+
                 self.queue.queue.clear()
                 self.queue.queue.extend(kept)
 
                 if len(self.queue.queue) >= self.queue.maxsize:
-                    removable = None
-                    for idx, existing in enumerate(self.queue.queue):
-                        if str(existing[1]).upper() != "CRITICAL":
-                            removable = idx
-                            break
-                    if removable is None:
-                        return
-                    dropped = self.queue.queue[removable]
-                    del self.queue.queue[removable]
-                    self.pending_times.pop(dropped[0], None)
-                    print(f"Speech: dropped pending -> {dropped[0]}")
+                    return
 
                 self.queue.queue.append(item)
-                self.pending_times[item[0]] = now
-                self.queue.unfinished_tasks += 1
+
+                # Rebuild pending timestamps from the actual queue contents.
+                self.pending_times.clear()
+                for queued in self.queue.queue:
+                    self.pending_times[queued[0]] = now
+
+                self.queue.unfinished_tasks = len(self.queue.queue)
                 self.queue.not_empty.notify()
+
             print(f"{log_prefix} -> {item[0]}")
         except Exception:
             pass
 
     def deterministic_fallback_message(self, bucket, direction):
+        """Generate varied fallback guidance without repeating the same opening."""
         bucket = str(bucket).upper()
+        direction = str(direction or "ahead")
+
         if bucket == "CRITICAL":
-            return speech_friendly_units(f"Stop. Critical obstacle on your {direction}.")
-        if bucket == "HIGH":
-            return speech_friendly_units(f"Stop. Obstacle on your {direction}.")
-        if bucket == "MEDIUM":
-            return speech_friendly_units(f"Caution. Obstacle on your {direction}.")
-        return ""
+            options = [
+                f"Stop now. Critical obstacle {direction}.",
+                f"Hold. Critical obstacle {direction}.",
+                f"Do not advance. Collision danger {direction}.",
+                f"Immediate danger {direction}. Hold position.",
+                f"Careful. Critical obstacle very close {direction}.",
+            ]
+        elif bucket == "HIGH":
+            options = [
+                f"Obstacle {direction}. Slow down and keep clear.",
+                f"High-risk obstacle {direction}. Reduce speed.",
+                f"Obstacle close {direction}. Adjust your path carefully.",
+                f"Obstacle {direction}. Take care and avoid moving straight ahead.",
+            ]
+        elif bucket == "MEDIUM":
+            options = [
+                f"Caution. Obstacle {direction}. Slow down.",
+                f"Watch your path {direction}. Reduce speed.",
+                f"Caution ahead {direction}. Move carefully.",
+            ]
+        else:
+            return ""
+
+        # Stable but varied selection based on the event state, avoiding a
+        # random choice that could make repeated warnings unpredictable.
+        key = f"{bucket}|{direction}|{self.last_message or ''}|{time.monotonic():.1f}"
+        index = hash(key) % len(options)
+        return speech_friendly_units(options[index])
 
     def stop(self):
         self.running = False
@@ -811,14 +932,14 @@ class SpeechManager:
         except Exception:
             pass
         try:
-            self.piper_request_queue.put_nowait(None)
+            self.sapi_request_queue.put_nowait(None)
         except Exception:
             pass
         try:
-            if self.piper_process is not None:
-                self.piper_process.join(timeout=1.0)
-                if self.piper_process.is_alive():
-                    self.piper_process.terminate()
+            if self.sapi_process is not None:
+                self.sapi_process.join(timeout=1.0)
+                if self.sapi_process.is_alive():
+                    self.sapi_process.terminate()
         except Exception:
             pass
 
@@ -995,25 +1116,55 @@ class GroqNavigationManager:
         return True
 
     def _prompt(self, ctx):
-        ttc_text = (f"{ctx['ttc']:.1f} s" if ctx["ttc"] is not None else "unavailable")
-        return f"""You are a wearable navigation assistant for a visually impaired user.
-Give ONE short spoken instruction, maximum 18 words.
-Use ONLY the supplied facts. Never invent an obstacle, distance, direction, movement, or safe escape route.
-Never tell the user to turn left/right, step back, or choose an escape route unless that safe route is explicitly supplied.
-Always include distance and direction when available. Movement wording MUST match Closing speed: positive = approaching, negative = moving away. NEVER call a moving-away object approaching. If the closing speed is near zero, do NOT mention stationary or any movement state; simply describe the object, distance, direction, and required risk instruction.
-For distance in your spoken instruction, use centimetres below 1 metre (for example, 49 cm), and metres rounded to one decimal place at 1 metre or more (for example, 1.4 meters).
-Write speed units as "meters per second", never "m/s".
-CRITICAL: start with Stop and tell the user not to move forward.
-HIGH: start with Stop and give a cautious instruction.
-MEDIUM: start with Caution and tell the user to slow down.
-LOW: brief awareness only.
+        ttc_text = (
+            f"{ctx['ttc']:.1f} s"
+            if ctx["ttc"] is not None
+            else "unavailable"
+        )
+        return f"""You are a concise wearable navigation assistant.
+Give ONE natural spoken instruction, maximum 22 words.
 
+Your job is to help the user avoid a collision without sounding repetitive.
+Use the supplied object, distance, direction, movement state, risk, and TTC only.
+
+DISTANCE:
+- Below 1 metre: use centimetres.
+- At 1 metre or more: use metres rounded to one decimal place.
+- Speed must be spoken as "meters per second".
+
+MOVEMENT:
+- Positive closing speed = approaching.
+- Negative closing speed = moving away.
+- Near zero = omit movement wording.
+Never describe a moving-away object as approaching.
+
+IMPORTANT SAFETY:
+- Do not claim a route is safe when safety/free space was not measured.
+- You may suggest a GENERIC countermeasure only as a conditional instruction, such as
+  "move slightly right if clear" or "shift left if the path is clear".
+- Never invent a measured safe distance, opening, or free-space corridor.
+- Never tell the user to make a large turn, step backward, or move several metres unless that action/distance was explicitly supplied.
+- You may use "avoid moving straight ahead" when the obstacle is in the forward path.
+
+STYLE:
+- Do NOT start every HIGH warning with "Stop".
+- HIGH should sound varied and natural: "Caution...", "Obstacle close...", "Watch your path...", "Keep clear...", "Slow down..."
+- HIGH may use a conditional countermeasure when it helps: e.g. "Obstacle front-left at 50 centimetres; move slightly right if clear."
+- CRITICAL must be urgent and should normally begin with "Stop".
+- MEDIUM should normally begin with "Caution" or "Watch your path".
+- Avoid repeating the same sentence structure for consecutive events.
+- Mention the object when known. Say "unknown object" when that is the object label.
+- Include distance and direction whenever available.
+- If the object is moving away, you can say "moving away" but do not overemphasize it.
+- Never say "stationary".
+
+Risk: {ctx['bucket']}
 Object: {ctx['object']}
 Distance: {ctx['distance']:.2f} m
 Direction: {ctx['direction']}
 Closing speed: {ctx['closing_speed']:+.2f} m/s
+Movement: {ctx['approach_state']}
 TTC: {ttc_text}
-Risk: {ctx['bucket']}
 """
 
     def _call_groq(self, ctx):
@@ -1025,6 +1176,30 @@ Risk: {ctx['bucket']}
             reasoning_effort="none",
         )
         text = response.choices[0].message.content.strip()
+
+        # HIGH risk does not need the same "Stop" opening on every event.
+        # Convert repetitive openings into varied caution language while
+        # preserving CRITICAL urgency.
+        if str(ctx["bucket"]).upper() == "HIGH":
+            text = re.sub(
+                r"^\s*stop[.!,:;\-]*\s*",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            )
+            openings = [
+                "Caution. ",
+                "Obstacle close. ",
+                "Watch your path. ",
+                "Keep clear. ",
+                "Slow down. ",
+            ]
+            selector = hash(
+                f"{ctx['object']}|{ctx['direction']}|{round(ctx['distance'], 1)}|{ctx['approach_state']}"
+            ) % len(openings)
+            opening = openings[selector]
+            if not text.lower().startswith(tuple(o.lower().strip() for o in openings)):
+                text = opening + text[:1].lower() + text[1:] if text else opening.strip()
         # Enforce the signed motion state after the LLM response so a negative
         # closing speed can never be described as approaching.
         state = self._approach_state(ctx["closing_speed"])
@@ -1326,7 +1501,7 @@ class LatestFrameReader:
         with self.lock:
             if self.latest_frame is None:
                 return False, None
-            return True, self.latest_frame.copy()
+            return True, self.latest_frame
 
     def release(self):
         self.running = False
@@ -1342,7 +1517,7 @@ YOLO_INPUT_SIZE = 256
 
 # Run YOLO every 2nd frame to reduce inference load.
 # Tracking keeps the latest detected objects between YOLO passes.
-YOLO_INFERENCE_EVERY_N_FRAMES = 2
+YOLO_INFERENCE_EVERY_N_FRAMES = 3
 
 # Match the confidence/NMS style of a normal YOLO detection pipeline.
 YOLO_CONF_THRESHOLD = 0.25
@@ -1404,7 +1579,7 @@ MED_HIGH_BOUNDARY = 0.66
 # Live inference does not need to run the neural network on every camera
 # frame. Running every N frames reduces CPU load while retaining a smooth
 # risk display.
-GRU_INFERENCE_EVERY_N_FRAMES = 3
+GRU_INFERENCE_EVERY_N_FRAMES = 5
 
 # ---- MiDaS Small + OpenVINO ----
 # MiDaS does NOT change the GRU inputs. Confirmed unknown protrusions are
@@ -1412,7 +1587,7 @@ GRU_INFERENCE_EVERY_N_FRAMES = 3
 MIDAS_MODEL_FILE = "MiDaS/weights/openvino/openvino_midas_v21_small_256.xml"
 MIDAS_DEVICE = "GPU"
 MIDAS_INPUT_SIZE = 256
-MIDAS_INFERENCE_EVERY_N_FRAMES = 2       # Async; main loop never waits for it.
+MIDAS_INFERENCE_EVERY_N_FRAMES = 4       # Async; reduce GPU/CPU contention with YOLO.
 
 # ---- immediate proximity safety layer ----
 # These are deliberately NOT fed back into the GRU. The GRU remains the
@@ -1550,8 +1725,10 @@ MIDAS_DISTANCE_FALLBACK = 4.0
 MIDAS_DISTANCE_EMA_ALPHA = 0.18
 
 ROTATE = False                   # keep native landscape orientation
-PROCESS_WIDTH = None             # keep native resolution -- set to an int to force resize
-DISPLAY_MAX_WIDTH = 960          # display window is capped to this width so it fits on
+PROCESS_WIDTH = 640             # cap processing/display workload; YOLO/MiDaS inputs remain 256px
+# Performance mode: process a smaller working frame and skip redundant neural inferences.
+# This reduces main-loop blocking and prevents the live video from falling behind the stream.
+DISPLAY_MAX_WIDTH = 1280          # display window is capped to this width so it fits on
                                   # screen -- purely visual, does NOT affect detection/
                                   # calibration, which still run on the native frame
 
@@ -3380,6 +3557,7 @@ def main():
     reader = LatestFrameReader(SOURCE)
     ultrasonic = UltrasonicReceiver(host="0.0.0.0", port=4210)
     speech = SpeechManager()
+    display_throttler = DisplayThrottler()
     groq_navigation = GroqNavigationManager(speech)
 
     try:
@@ -3434,6 +3612,11 @@ def main():
     # Once a depth result exists, keep the display panels alive using the
     # last valid result instead of hiding them on intermittent worker timing.
     have_depth_result = False
+    # Cache the rendered depth/mask panels. Rebuilding and resizing these three
+    # large images on every loop was a major source of display stalls.
+    cached_depth_vis = None
+    cached_mask_vis = None
+    cached_depth_shape = None
 
     fps = 0.0
     last_loop_time = time.perf_counter()
@@ -4863,16 +5046,35 @@ def main():
                         1,
                     )
 
-            # Build depth image and mask image without text overlays.
+            # Build depth/mask bases only when a NEW MiDaS result arrives.
+            # Re-rendering and upscaling the depth map every camera iteration
+            # was unnecessarily expensive and caused visible video stalls.
             if have_depth_result and latest_midas_depth is not None:
                 try:
-                    depth_vis = midas_visual(
-                        latest_midas_depth,
-                        w,
-                        h,
-                    )
+                    if (
+                        cached_depth_vis is None
+                        or cached_mask_vis is None
+                        or cached_depth_shape != (h, w)
+                        or depth_result is not None
+                    ):
+                        cached_depth_vis = midas_visual(
+                            latest_midas_depth,
+                            w,
+                            h,
+                        )
+                        if latest_unknown_mask is not None and latest_unknown_mask.size > 0:
+                            cached_mask_vis = cv2.cvtColor(
+                                latest_unknown_mask,
+                                cv2.COLOR_GRAY2BGR,
+                            )
+                        else:
+                            cached_mask_vis = np.zeros((h, w, 3), dtype=np.uint8)
+                        cached_depth_shape = (h, w)
 
-                    # Same final physical obstacles, no labels.
+                    depth_vis = cached_depth_vis.copy()
+                    mask_vis = cached_mask_vis.copy()
+
+                    # Draw current tracks on a cheap copy of the cached depth image.
                     for tr in final_obstacles:
                         if tr.box is None:
                             continue
@@ -4882,22 +5084,7 @@ def main():
                             else ((0, 255, 255) if is_unknown else (150, 150, 150))
                         )
                         x1, y1, x2, y2 = map(int, tr.box)
-                        cv2.rectangle(
-                            depth_vis,
-                            (x1, y1), (x2, y2),
-                            color, 3,
-                        )
-
-                    if latest_unknown_mask is not None and latest_unknown_mask.size > 0:
-                        mask_vis = cv2.cvtColor(
-                            latest_unknown_mask,
-                            cv2.COLOR_GRAY2BGR,
-                        )
-                    else:
-                        mask_vis = np.zeros(
-                            (h, w, 3),
-                            dtype=np.uint8,
-                        )
+                        cv2.rectangle(depth_vis, (x1, y1), (x2, y2), color, 3)
 
                 except Exception as exc:
                     print(f"MiDaS display warning: {exc}")
@@ -4936,12 +5123,26 @@ def main():
                 )
             )
 
-            safe_imshow(
-                "wearable-nav + LIVE GRU + MiDaS",
-                combined,
-            )
+            # Keep the processing frame at 640px, but cap the actual UI frame.
+            # The previous 3-panel 1920px+ image made OpenCV window updates
+            # expensive enough to look like the video was freezing during TTS.
+            display_frame = combined
+            if display_frame.shape[1] > DISPLAY_MAX_WIDTH:
+                scale = DISPLAY_MAX_WIDTH / float(display_frame.shape[1])
+                display_frame = cv2.resize(
+                    display_frame,
+                    (DISPLAY_MAX_WIDTH, max(1, int(display_frame.shape[0] * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            # TTS playback must NEVER pause the live video display.
+            # winsound/Piper run outside the main vision loop.
+            display_throttler.do_display("wearable-nav + LIVE GRU + MiDaS", display_frame)
 
             key = cv2.waitKey(1) & 0xFF
+            
+            # OPTIMIZATION: Cap display FPS to reduce GPU/CPU load during processing
+            time.sleep(0.005)  # ~200 FPS cap; increase to 0.010 for ~100 FPS
 
             if key == ord("c"):
                 if selected is None:

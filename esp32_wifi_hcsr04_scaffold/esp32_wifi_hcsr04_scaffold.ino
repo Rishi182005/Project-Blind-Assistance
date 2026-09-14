@@ -1,111 +1,95 @@
-#include <WiFi.h>
-#include <WiFiUdp.h>
+#include <Wire.h>
 
-// Keep the SAME Wi-Fi credentials from your current working sketch.
-const char* WIFI_SSID = "Rishi's Network";
-const char* WIFI_PASSWORD = "Devi@1002";
+#define PCA9685_ADDR 0x40
+#define SDA_PIN 21
+#define SCL_PIN 22
 
-const char* LAPTOP_IP = "192.168.29.85";
-const uint16_t LAPTOP_PORT = 4210;
+#define MODE1 0x00
+#define PRESCALE 0xFE
+#define LED0_ON_L 0x06
 
-// Sensor 1: FRONT
-const int FRONT_TRIG_PIN = 5;
-const int FRONT_ECHO_PIN = 18;
-
-// Sensor 2: REAR
-const int REAR_TRIG_PIN = 19;
-const int REAR_ECHO_PIN = 23;
-
-WiFiUDP udp;
-
-float readDistanceCm(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-
-  unsigned long duration = pulseIn(echoPin, HIGH, 30000UL);
-  if (duration == 0) {
-    return -1.0f;
-  }
-
-  return (float)duration * 0.0343f / 2.0f;
+void writeRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(PCA9685_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
 }
 
-void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+void setPWM(uint8_t channel, uint16_t on, uint16_t off) {
+  uint8_t reg = LED0_ON_L + (4 * channel);
 
-  Serial.print("Connecting to Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  Wire.beginTransmission(PCA9685_ADDR);
+  Wire.write(reg);
+
+  Wire.write(on & 0xFF);
+  Wire.write(on >> 8);
+
+  Wire.write(off & 0xFF);
+  Wire.write(off >> 8);
+
+  Wire.endTransmission();
+}
+
+void setDutyPercent(uint8_t percent) {
+  percent = constrain(percent, 0, 100);
+
+  uint16_t offValue = (4095UL * percent) / 100UL;
+
+  if (percent == 0) {
+    setPWM(0, 0, 0);
   }
-
-  Serial.println();
-  Serial.print("Wi-Fi connected. ESP32 IP: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("Sending UDP to: ");
-  Serial.print(LAPTOP_IP);
-  Serial.print(":");
-  Serial.println(LAPTOP_PORT);
+  else if (percent == 100) {
+    setPWM(0, 4096, 0);
+  }
+  else {
+    setPWM(0, 0, offValue);
+  }
 }
 
 void setup() {
   Serial.begin(115200);
 
-  pinMode(FRONT_TRIG_PIN, OUTPUT);
-  pinMode(FRONT_ECHO_PIN, INPUT);
+  Wire.begin(SDA_PIN, SCL_PIN);
 
-  pinMode(REAR_TRIG_PIN, OUTPUT);
-  pinMode(REAR_ECHO_PIN, INPUT);
+  // Put PCA9685 into sleep mode
+  writeRegister(MODE1, 0x10);
 
-  digitalWrite(FRONT_TRIG_PIN, LOW);
-  digitalWrite(REAR_TRIG_PIN, LOW);
+  // ~200 Hz PWM
+  writeRegister(PRESCALE, 29);
 
-  connectWiFi();
+  // Wake up
+  writeRegister(MODE1, 0x00);
+
+  delay(10);
+
+  // Restart + auto increment
+  writeRegister(MODE1, 0xA1);
+
+  // Start with LED OFF
+  setDutyPercent(0);
+
+  Serial.println("PCA9685 PWM0 LED test");
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
-  }
 
-  // Trigger the two sensors separately so their ultrasonic pulses do not
-  // overlap and cause cross-talk.
-  float frontCm = readDistanceCm(FRONT_TRIG_PIN, FRONT_ECHO_PIN);
-  delay(60);
-  float rearCm = readDistanceCm(REAR_TRIG_PIN, REAR_ECHO_PIN);
+  Serial.println("PWM0 = 0%");
+  setDutyPercent(0);
+  delay(2000);
 
-  char packet[128];
-  snprintf(
-    packet,
-    sizeof(packet),
-    "front_cm:%.1f,rear_cm:%.1f,ts:%lu",
-    frontCm,
-    rearCm,
-    millis()
-  );
+  Serial.println("PWM0 = 25%");
+  setDutyPercent(25);
+  delay(2000);
 
-  udp.beginPacket(LAPTOP_IP, LAPTOP_PORT);
-  udp.print(packet);
-  udp.endPacket();
+  Serial.println("PWM0 = 50%");
+  setDutyPercent(50);
+  delay(2000);
 
-  Serial.print("FRONT: ");
-  if (frontCm < 0) Serial.print("No reading");
-  else {
-    Serial.print(frontCm, 1);
-    Serial.print(" cm");
-  }
+  Serial.println("PWM0 = 75%");
+  setDutyPercent(75);
+  delay(2000);
 
-  Serial.print("    REAR: ");
-  if (rearCm < 0) Serial.println("No reading");
-  else {
-    Serial.print(rearCm, 1);
-    Serial.println(" cm");
-  }
-
-  delay(40);
+  Serial.println("PWM0 = 100%");
+  setDutyPercent(100);
+  delay(2000);
 }
