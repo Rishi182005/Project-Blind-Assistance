@@ -88,11 +88,21 @@ GROQ_MAX_TOKENS = 50
 GROQ_DISTANCE_EVENT_M = 0.60
 GROQ_MIN_EVENT_INTERVAL_S = 2.00
 
+# Far-range safety policy: known visual objects beyond this distance are not
+# allowed to become MEDIUM/HIGH from noisy GRU scores unless they are genuinely
+# closing fast. This prevents harmless 3.5-4 m bbox jitter from generating speech.
+FAR_OBJECT_MAX_DISTANCE_M = 3.00
+# A far visual object is allowed above LOW only when the approach is clearly
+# meaningful, not merely positive bbox noise.  At 3+ m, require both a robust
+# closing speed and a short TTC before allowing MEDIUM/HIGH.
+FAR_OBJECT_APPROACH_SPEED_MPS = 0.30
+FAR_OBJECT_MAX_TTC_S = 6.0
+
 
 # ---- ESP32 haptic feedback layer ----
 # Python sends only high-level commands; the ESP32 generates local pulse patterns.
 HAPTIC_ENABLED = True
-HAPTIC_SERIAL_PORT = "AUTO"
+HAPTIC_SERIAL_PORT = "COM13"
 HAPTIC_BAUD = 115200
 HAPTIC_SERIAL_TIMEOUT_S = 0.05
 HAPTIC_RECONNECT_S = 2.0
@@ -511,6 +521,10 @@ class SpeechManager:
 
         # Per-track repetition state. A stable obstacle is not announced every frame.
         self.repeat_state = {}
+        # Announce the semantic object label only once per physical track/encounter.
+        # Later warnings for the same track keep the safety information (distance,
+        # direction, movement) but omit repeating "person/backpack/etc.".
+        self.object_presence_announced = set()
         self.last_interrupt_time = 0.0
         # After a CRITICAL/TTC warning, suppress stale non-critical Groq
         # responses briefly so an in-flight LLM result cannot re-enter the
@@ -601,14 +615,29 @@ class SpeechManager:
         if old_item is None:
             return True
 
-        _om, old_bucket, _od, old_dist, old_ttc, _old_track = old_item
-        _nm, new_bucket, _nd, new_dist, new_ttc, _new_track = new_item
+        _om, old_bucket, old_direction, old_dist, old_ttc, old_track = old_item
+        _nm, new_bucket, new_direction, new_dist, new_ttc, new_track = new_item
 
         old_sev = cls._SEVERITY.get(str(old_bucket).upper(), 0)
         new_sev = cls._SEVERITY.get(str(new_bucket).upper(), 0)
 
-        # Emergency always wins.
+        # Emergency normally wins, but do not repeatedly interrupt one CRITICAL
+        # sentence with another CRITICAL update for the SAME physical track and
+        # same direction unless the hazard is materially worse. This prevents
+        # bbox/noise oscillation from hammering SAPI with stop/start commands.
         if new_sev >= cls._SEVERITY["CRITICAL"]:
+            same_track = old_track is not None and new_track is not None and old_track == new_track
+            same_direction = str(old_direction).lower() == str(new_direction).lower()
+            if same_track and same_direction and old_sev >= cls._SEVERITY["CRITICAL"]:
+                try:
+                    if (
+                        old_dist is not None and new_dist is not None
+                        and float(new_dist) >= float(old_dist) - 0.15
+                        and (old_ttc is None or new_ttc is None or float(new_ttc) >= float(old_ttc) - 0.5)
+                    ):
+                        return False
+                except Exception:
+                    pass
             return True
 
         # A new HIGH warning should not wait behind a LOW/MEDIUM sentence.
@@ -680,6 +709,51 @@ class SpeechManager:
 
     def _forget_repeat_state_for_safe_scene(self):
         self.repeat_state.clear()
+        self.object_presence_announced.clear()
+
+    @staticmethod
+    def _object_label(selected=None, object_name=None):
+        if object_name:
+            label = str(object_name).strip().lower()
+        else:
+            label = str(getattr(selected, "cls_name", "") or "").strip().lower()
+        if not label or label in {"none", "null", "nan", "obstacle"}:
+            source = str(getattr(selected, "source", "") or "").upper()
+            return "unknown object" if source == "MIDAS" else "obstacle"
+        return label
+
+    def _apply_object_presence_once(self, message, track_key=None, selected=None, object_name=None):
+        """Keep the object's semantic label in the first spoken warning only.
+
+        A track is the physical identity. Once that track has been announced,
+        later warnings remove the semantic label when it can be removed cleanly.
+        """
+        text = speech_friendly_units(str(message).strip())
+        if not text or track_key is None:
+            return text
+
+        label = self._object_label(selected, object_name)
+        if not label or label == "obstacle":
+            self.object_presence_announced.add(track_key)
+            return text
+
+        with self.lock:
+            first_announcement = track_key not in self.object_presence_announced
+            if first_announcement:
+                self.object_presence_announced.add(track_key)
+
+        if first_announcement:
+            return text
+
+        # Remove the known semantic label from subsequent LLM/fallback sentences.
+        # Keep punctuation and distance/direction wording intact.
+        escaped = re.escape(label)
+        text = re.sub(rf"(?i)\b{escaped}\b\s*", "", text, count=1)
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"\s+([,.;!?])", r"\1", text)
+        text = re.sub(r"([:;])\s*([0-9])", r"\1 \2", text)
+        text = text.strip(" ,;:-")
+        return text or speech_friendly_units(str(message).strip())
 
     def _synthesize(self, message):
         """Start SAPI speech asynchronously; return immediately."""
@@ -813,7 +887,9 @@ class SpeechManager:
             self._clear_queue(); self._forget_repeat_state_for_safe_scene(); return
         if bucket not in self._SEVERITY:
             return
-        direction = forced_direction or self._direction(selected, frame_width, unknown_zone)
+        direction = _normalize_navigation_direction(
+            selected, frame_width, forced_direction, unknown_zone=unknown_zone
+        )
         # Never speak an invalid/unknown direction. If a caller supplies a
         # placeholder such as None or "none", derive the direction from the
         # selected object/sensor instead.
@@ -830,7 +906,7 @@ class SpeechManager:
         message = ""
         distance = None; ttc = None; track_key = None
         if selected is not None:
-            track_key = getattr(selected, "track_id", id(selected))
+            track_key = _object_track_key(selected)
             try:
                 distance = float(getattr(selected, "distance_m", getattr(selected, "smoothed_dist", float("nan"))))
                 if not math.isfinite(distance) or distance <= 0: distance = None
@@ -846,6 +922,9 @@ class SpeechManager:
             except Exception: ttc = None
 
         message = self.deterministic_fallback_message(bucket, direction, motion_state)
+        message = self._apply_object_presence_once(
+            message, track_key=track_key, selected=selected
+        )
         item = (speech_friendly_units(message), bucket, direction, distance, ttc, track_key)
 
         # A real CRITICAL message takes ownership of speech immediately.
@@ -898,7 +977,7 @@ class SpeechManager:
         reduces frame-to-frame sign flips, while a small deadband prevents
         harmless jitter around zero from changing the motion state repeatedly.
         """
-        track_key = getattr(selected, "track_id", id(selected))
+        track_key = _object_track_key(selected)
         now = time.monotonic()
         state = self.closing_speed_state.get(track_key)
 
@@ -948,7 +1027,7 @@ class SpeechManager:
         except (TypeError, ValueError):
             return False
 
-        now = time.monotonic(); track_key = getattr(selected, "track_id", id(selected))
+        now = time.monotonic(); track_key = _object_track_key(selected)
         alert_state = self.object_alert_counts.get(track_key, {"count": 0, "last": 0.0})
         if alert_state["count"] >= TTC_MAX_ALERTS_PER_OBJECT:
             return False
@@ -974,11 +1053,7 @@ class SpeechManager:
         self.ttc_alert_safe_since = 0.0
         if now - self.ttc_alert_last < TTC_SPEECH_COOLDOWN_S or (self.ttc_alert_track == track_key and now < self.ttc_alert_until):
             return False
-        direction = direction or self._direction(selected, frame_width)
-        if str(direction).strip().lower() in {"", "none", "null", "unknown", "nan"}:
-            direction = self._direction(selected, frame_width)
-        if str(direction).strip().lower() in {"", "none", "null", "unknown", "nan"}:
-            direction = "ahead"
+        direction = _normalize_navigation_direction(selected, frame_width, direction)
 
         # Use the single project-wide speech distance policy.
         spoken_distance = format_spoken_distance(distance)
@@ -997,6 +1072,20 @@ class SpeechManager:
             )
         ttc_index = (int(time.monotonic() * 10) + (track_key or 0)) % len(ttc_options)
         text = ttc_options[ttc_index]
+        # Include the semantic object only in this track's first spoken alert.
+        # TTC messages remain safety-first and never depend on Groq.
+        object_label = self._object_label(selected)
+        first_ttc = track_key not in self.object_presence_announced
+        if first_ttc and object_label not in {"obstacle", "unknown object"}:
+            if str(direction).lower() in {"back", "rear"}:
+                text = re.sub(r"^Fast approaching obstacle", f"Fast approaching {object_label}", text)
+                text = re.sub(r"^Immediate danger behind you", f"Immediate danger: {object_label} behind you", text)
+                text = re.sub(r"^Obstacle ", f"{object_label.capitalize()} ", text)
+            else:
+                text = re.sub(r"^Stop\. Fast approaching obstacle", f"Stop. Fast approaching {object_label}", text)
+                text = re.sub(r"^Immediate danger\. Obstacle", f"Immediate danger. {object_label.capitalize()}", text)
+                text = re.sub(r"^Do not move forward\. Fast-moving obstacle", f"Do not move forward. Fast-moving {object_label}", text)
+        text = self._apply_object_presence_once(text, track_key=track_key, selected=selected)
         item = (speech_friendly_units(text), "CRITICAL", direction, float(distance) if distance > 0 else None, float(ttc) if ttc > 0 else None, track_key)
         with self.lock:
             active_item = self.active_item; active = bool(self.active_playback)
@@ -1023,7 +1112,7 @@ class SpeechManager:
         self._clear_queue(); self._queue_latest(item, log_prefix=f"Speech: TTC emergency -> {item[0]}")
         return True
 
-    def request_message(self, message, bucket, direction=None):
+    def request_message(self, message, bucket, direction=None, track_key=None, object_name=None):
         if not SPEECH_ENABLED or not self.running:
             return
         if bucket == "LOW":
@@ -1039,7 +1128,21 @@ class SpeechManager:
             # Do not invent an object label here; the normal Groq message is
             # retained unless it explicitly contains a low-risk label.
         message = speech_friendly_units(str(message).strip())
+        if track_key is not None:
+            message = self._apply_object_presence_once(
+                message, track_key=track_key, object_name=object_name
+            )
         if not message:
+            return
+        # Never send an obvious continuation fragment to TTS. A truncated LLM
+        # result such as ", moving away at 7 centimeters per second." would
+        # otherwise sound like the first half of the warning was cut off.
+        if re.match(r"^[,.;:!?\-–—]", message) or re.match(
+            r"^(?:the\s+)?(?:obstacle\s+)?(?:is\s+)?moving\s+away\b",
+            message,
+            re.IGNORECASE,
+        ):
+            print(f"Speech: dropped fragment -> {message}")
             return
         bucket = str(bucket).upper(); distance = self._message_distance(message)
         item = (message, bucket, direction, distance, None, None)
@@ -1220,6 +1323,47 @@ class SpeechManager:
         except Exception:
             pass
 
+def _object_track_key(obj):
+    """Return the real Track identity used by the physical-object tracker."""
+    if obj is None:
+        return None
+    track_id = getattr(obj, "track_id", None)
+    if track_id is not None:
+        return track_id
+    real_id = getattr(obj, "id", None)
+    return real_id if real_id is not None else id(obj)
+
+
+def _normalize_navigation_direction(selected, frame_width, direction=None, unknown_zone=""):
+    """Reject invalid direction placeholders and derive direction from geometry/source."""
+    d = str(direction or "").strip().lower()
+    invalid = {"", "none", "null", "unknown", "nan", "none-left", "none-right"}
+    if d not in invalid:
+        return d
+
+    if selected is not None:
+        box = getattr(selected, "box", None)
+        if box is None:
+            source = str(getattr(selected, "source", "")).upper()
+            if "REAR" in source or "BACK" in source:
+                return "back"
+            return "front"
+        try:
+            cx = (float(box[0]) + float(box[2])) / 2.0
+            if cx < frame_width * 0.33:
+                side = "left"
+            elif cx > frame_width * 0.67:
+                side = "right"
+            else:
+                side = "center"
+            if unknown_zone:
+                return f"{unknown_zone}-{side}" if side != "center" else unknown_zone
+            return side
+        except Exception:
+            pass
+    return "front"
+
+
 class GroqNavigationManager:
     """Event-triggered Groq navigation assistant.
 
@@ -1286,11 +1430,12 @@ class GroqNavigationManager:
         )
         self.thread.start()
 
-    @staticmethod
-    def _approach_state(closing_speed):
-        return closing_motion_state(closing_speed)
+    def _approach_state(self, closing_speed):
+        # Speech/LLM narration uses a stricter threshold than the raw closing
+        # speed so tiny bbox-size changes do not become "moving away" events.
+        return self._narration_motion_state(closing_speed)
 
-    def _make_context(self, bucket, obj_name, distance, direction, closing_speed, ttc):
+    def _make_context(self, bucket, obj_name, distance, direction, closing_speed, ttc, track_key=None):
         return {
             "bucket": str(bucket).upper(),
             "object": str(obj_name),
@@ -1299,7 +1444,21 @@ class GroqNavigationManager:
             "closing_speed": float(closing_speed),
             "ttc": float(ttc) if ttc is not None and np.isfinite(ttc) and ttc < 900 else None,
             "approach_state": self._approach_state(closing_speed),
+            "track_key": track_key,
         }
+
+    def _narration_motion_state(self, closing_speed):
+        """Return a motion state only when speed is large enough to beat bbox jitter."""
+        try:
+            speed = float(closing_speed)
+        except (TypeError, ValueError):
+            speed = 0.0
+        threshold = MOTION_NARRATION_SPEED_THRESHOLD
+        if speed >= threshold:
+            return "approaching"
+        if speed <= -threshold:
+            return "moving away"
+        return "stationary"
 
     def _meaningful_event(self, ctx, now):
         previous = self.last_context
@@ -1309,9 +1468,21 @@ class GroqNavigationManager:
         if now - self.last_event_time < GROQ_MIN_EVENT_INTERVAL_S:
             return False
 
-        # A different physical obstacle or direction is a new event.
-        if ctx["object"] != previous["object"]:
+        # Track identity represents the physical obstacle. A YOLO label change
+        # (for example backpack -> suitcase) on the SAME track is not a new event.
+        # A genuinely different track is a new physical obstacle event.
+        same_track = (
+            ctx.get("track_key") is not None
+            and previous.get("track_key") is not None
+            and ctx.get("track_key") == previous.get("track_key")
+        )
+        if previous.get("track_key") is not None and ctx.get("track_key") is not None:
+            if ctx.get("track_key") != previous.get("track_key"):
+                return True
+        elif ctx["object"] != previous["object"]:
+            # Legacy/virtual tracks without IDs still fall back to the label.
             return True
+
         if ctx["direction"] != previous["direction"]:
             return True
 
@@ -1342,14 +1513,12 @@ class GroqNavigationManager:
             if abs(ctx["distance"] - previous["distance"]) >= GROQ_DISTANCE_EVENT_M:
                 return True
 
-        # Movement-state changes are meaningful even when risk bucket and
-        # distance have not changed enough to trigger another event. This is
-        # important because the spoken message must explicitly say "moving
-        # away" when the signed closing speed is negative.
-        if ctx["approach_state"] != previous["approach_state"]:
-            return True
+        # IMPORTANT: bbox-size jitter must NOT create a new Groq request merely
+        # because a tiny speed estimate crossed zero. Motion wording belongs to
+        # the current event; a new event is created only by a real direction/risk/
+        # distance change. This is what prevents "...moving away at 7 cm/s"
+        # from becoming a second sentence.
 
-        # Severity decrease / normal approach-state jitter: stay silent.
         self.bucket_change_candidate = None
         self.bucket_change_start = None
         return False
@@ -1365,17 +1534,22 @@ class GroqNavigationManager:
             self.bucket_change_candidate = None
             self.bucket_change_start = None
 
-    def request(self, bucket, obj_name, distance, direction, closing_speed, ttc):
+    def request(self, bucket, obj_name, distance, direction, closing_speed, ttc, track_key=None):
         """Submit only meaningful navigation-state changes to Groq.
 
         CRITICAL is intentionally not sent to Groq: immediate deterministic
         safety speech must never wait for a network response.
         """
         bucket = str(bucket).upper()
+        # LOW risk is haptic-only in the interaction design; do not generate
+        # an LLM sentence for it. This also eliminates needless speech from
+        # harmless bbox jitter at long range.
+        if bucket == "LOW":
+            return False
         if bucket == "CRITICAL":
             return False
         ctx = self._make_context(
-            bucket, obj_name, distance, direction, closing_speed, ttc
+            bucket, obj_name, distance, direction, closing_speed, ttc, track_key=track_key
         )
         now = time.monotonic()
         with self.lock:
@@ -1447,6 +1621,23 @@ Movement: {ctx['approach_state']}
 TTC: {ttc_text}
 """
 
+    @staticmethod
+    def _is_fragment_response(text):
+        """Reject truncated/continuation-like LLM output before it reaches TTS."""
+        text = str(text or "").strip()
+        if not text:
+            return True
+        # A continuation beginning with punctuation is not a complete spoken warning.
+        if re.match(r"^[,.;:!?\-–—]", text):
+            return True
+        # Likewise, a movement-only continuation is exactly the failure mode seen
+        # when a second event is generated from bbox jitter.
+        if re.match(r"^(?:the\s+)?(?:obstacle\s+)?(?:is\s+)?moving\s+away\b", text, re.IGNORECASE):
+            return True
+        if re.match(r"^(?:the\s+)?(?:obstacle\s+)?(?:is\s+)?approaching\b", text, re.IGNORECASE):
+            return True
+        return False
+
     def _call_groq(self, ctx):
         response = self.client.chat.completions.create(
             model=GROQ_MODEL,
@@ -1456,6 +1647,8 @@ TTC: {ttc_text}
             reasoning_effort="low",
         )
         text = response.choices[0].message.content.strip()
+        if self._is_fragment_response(text):
+            raise RuntimeError("fragmented Groq response")
 
         # HIGH risk does not need the same "Stop" opening on every event.
         # Convert repetitive openings into varied caution language while
@@ -1559,6 +1752,8 @@ TTC: {ttc_text}
                     ),
                     ctx["bucket"],
                     direction,
+                    track_key=ctx.get("track_key"),
+                    object_name=ctx.get("object"),
                 )
                 continue
 
@@ -1582,7 +1777,11 @@ TTC: {ttc_text}
                     print("Groq: stale response discarded")
                     continue
                 self.speech.request_message(
-                    message, ctx["bucket"], ctx["direction"]
+                    message,
+                    ctx["bucket"],
+                    ctx["direction"],
+                    track_key=ctx.get("track_key"),
+                    object_name=ctx.get("object"),
                 )
             except Exception as exc:
                 print(f"Groq ERROR: {exc}")
@@ -1601,6 +1800,8 @@ TTC: {ttc_text}
                     ),
                     ctx["bucket"],
                     ctx["direction"],
+                    track_key=ctx.get("track_key"),
+                    object_name=ctx.get("object"),
                 )
 
     def stop(self):
@@ -1971,6 +2172,11 @@ EMA_ALPHA = 0.12
 CLOSING_SPEED_EMA_ALPHA = 0.14
 RISK_EMA_ALPHA = 0.16
 SPEED_WINDOW = 8                 # frames of history kept per tracked object
+
+# Motion narration must ignore small apparent-size changes from YOLO bbox jitter.
+# These thresholds affect spoken motion-state changes, not the GRU feature itself.
+MOTION_NARRATION_SPEED_THRESHOLD = 0.12   # m/s; below this is treated as neutral
+MOTION_NARRATION_STABLE_S = 1.00          # state must persist this long before narration changes
 
 # ---- distance fusion ----
 # Keep the original calibrated YOLO bbox-area model as the metric anchor.
@@ -4828,9 +5034,13 @@ def main():
             if selected is rear_ultrasonic_track:
                 selected_direction = "back"
             elif selected is ultrasonic_track:
-                selected_direction = ultrasonic_direction or "front"
+                selected_direction = _normalize_navigation_direction(
+                    selected, w, ultrasonic_direction, unknown_zone=""
+                )
             else:
-                selected_direction = None
+                selected_direction = _normalize_navigation_direction(
+                    selected, w, None, unknown_zone=""
+                )
 
             for tr in final_obstacles:
                 if tr.box is None:
@@ -4999,6 +5209,38 @@ def main():
                     )
                 )
 
+            # Compute TTC once for the far-range visual guard.
+            try:
+                _far_ttc = selected.ttc() if selected is not None else None
+                current_ttc_for_far_guard = (
+                    float(_far_ttc) if _far_ttc is not None and np.isfinite(_far_ttc) and _far_ttc > 0 else None
+                )
+            except Exception:
+                current_ttc_for_far_guard = None
+
+            # Far-range visual-object guard. At >3 m, a non-closing known
+            # object should remain LOW even if the GRU is temporarily noisy.
+            # A genuinely fast-closing object is exempt because it can still
+            # become dangerous despite its current distance.
+            if (
+                selected is not None
+                and getattr(selected, "source", "YOLO") == "YOLO"
+                and dist > FAR_OBJECT_MAX_DISTANCE_M
+                and final_bucket in {"MEDIUM", "HIGH"}
+            ):
+                far_fast_approach = (
+                    float(closing_speed) >= FAR_OBJECT_APPROACH_SPEED_MPS
+                    and current_ttc_for_far_guard is not None
+                    and current_ttc_for_far_guard <= FAR_OBJECT_MAX_TTC_S
+                )
+                if not far_fast_approach:
+                    final_bucket = "LOW"
+                    final_risk = min(float(final_risk), LOW_MED_BOUNDARY - 0.01)
+                    proximity_reason = (
+                        f"far visual object {dist:.2f} m; "
+                        f"closing {closing_speed:+.2f} m/s, TTC {current_ttc_for_far_guard if current_ttc_for_far_guard is not None else 999.0:.1f}s"
+                    )
+
             # ---------------------------------------------------------
             # MiDaS unknown-obstacle safety layer
             # ---------------------------------------------------------
@@ -5037,7 +5279,7 @@ def main():
             # Match the user's interaction design: low/medium/high/critical
             # haptic when the selected object is not moving; moving objects
             # are speech-only unless they reach CRITICAL safety state.
-            haptic.update(final_bucket, selected_direction or "front", closing_motion_state(closing_speed))
+            haptic.update(final_bucket, _normalize_navigation_direction(selected, w, selected_direction), closing_motion_state(closing_speed))
 
             # AUDIO / LLM NAVIGATION LAYER
             # ---------------------------------------------------------
@@ -5047,12 +5289,8 @@ def main():
             # or fails.
             # SpeechManager.request() already handles forced_direction.
             # _direction() does not accept that argument.
-            speech_direction = (
-                selected_direction
-                if selected_direction
-                else speech._direction(
-                    selected, w, unknown_zone=unknown_zone
-                )
+            speech_direction = _normalize_navigation_direction(
+                selected, w, selected_direction, unknown_zone=unknown_zone
             )
             current_ttc = (
                 selected.vision_ttc()
@@ -5093,6 +5331,7 @@ def main():
                     speech_direction,
                     closing_speed,
                     current_ttc,
+                    track_key=_object_track_key(selected),
                 )
             else:
                 # No selected obstacle: end the current Groq event episode.
