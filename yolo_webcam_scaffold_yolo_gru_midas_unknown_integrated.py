@@ -15,7 +15,7 @@ can be more urgent than a slow/stationary object that's physically closer
 (e.g. a pole 2m away). Picking by raw nearest-distance misses this --
 picking by TTC catches it.
 
-Still Software + haptic-controller integration; ESP32 drives the external PCA9685/ULN2003 motor hardware. YOLO distance uses the
+Still 100% software -- no new hardware required. YOLO distance uses the
 existing calibrated bbox-size heuristic. MiDaS-only distance uses raw MiDaS
 inverse-depth with a separate online metric calibration learned from matched
 YOLO+MiDaS objects.
@@ -88,16 +88,14 @@ GROQ_MAX_TOKENS = 50
 GROQ_DISTANCE_EVENT_M = 0.60
 GROQ_MIN_EVENT_INTERVAL_S = 2.00
 
+
 # ---- ESP32 haptic feedback layer ----
-# The ESP32 drives the PCA9685/ULN2003/motor hardware. Python sends only
-# high-level haptic states; the ESP32 generates the local PWM pulse pattern.
+# Python sends only high-level commands; the ESP32 generates local pulse patterns.
 HAPTIC_ENABLED = True
 HAPTIC_SERIAL_PORT = "AUTO"
 HAPTIC_BAUD = 115200
 HAPTIC_SERIAL_TIMEOUT_S = 0.05
 HAPTIC_RECONNECT_S = 2.0
-
-# User's physical motor placement.
 HAPTIC_DIRECTION_MAP = {
     "front": "FRONT",
     "ahead": "FRONT",
@@ -109,6 +107,158 @@ HAPTIC_DIRECTION_MAP = {
     "back": "BACK",
     "rear": "BACK",
 }
+
+class HapticManager:
+    """Non-blocking serial bridge from Python navigation state to the ESP32 haptic controller."""
+
+    def __init__(self):
+        self.enabled = bool(HAPTIC_ENABLED and serial is not None)
+        self.ser = None
+        self.last_command = None
+        self.last_attempt = 0.0
+        self.lock = threading.Lock()
+        if HAPTIC_ENABLED and serial is None:
+            print("Haptics: pyserial not installed | run: python -m pip install pyserial")
+        elif HAPTIC_ENABLED:
+            print(f"Haptics: enabled | serial={HAPTIC_SERIAL_PORT} | baud={HAPTIC_BAUD}")
+        else:
+            print("Haptics: disabled")
+
+    @staticmethod
+    def _port_candidates():
+        if list_ports is None:
+            return []
+        candidates = []
+        for p in list_ports.comports():
+            text = " ".join(
+                str(x or "") for x in (p.device, p.description, p.manufacturer, p.product)
+            ).lower()
+            vid = getattr(p, "vid", None)
+            # Common ESP32 USB-UART/native-USB identifiers. This is only a preference;
+            # AUTO will fall back to any available serial port if there is exactly one.
+            preferred_vids = {0x10C4, 0x1A86, 0x0403, 0x303A}
+            score = 0
+            if vid in preferred_vids:
+                score += 10
+            if "espressif" in text or "esp32" in text or "cp210" in text or "ch340" in text:
+                score += 5
+            candidates.append((score, p.device))
+        candidates.sort(reverse=True)
+        return [device for _score, device in candidates]
+
+    def _ensure_connected(self):
+        if not self.enabled:
+            return False
+        now = time.monotonic()
+        if self.ser is not None and getattr(self.ser, "is_open", False):
+            return True
+        if now - self.last_attempt < HAPTIC_RECONNECT_S:
+            return False
+        self.last_attempt = now
+
+        if str(HAPTIC_SERIAL_PORT).upper() == "AUTO":
+            ports = self._port_candidates()
+            if not ports:
+                return False
+            if len(ports) > 1 and ports[0] is not None:
+                # Prefer the best-scored candidate. If all scores are tied and
+                # several ports exist, print them so the user can set the port explicitly.
+                best_score = 0
+                if list_ports is not None:
+                    for p in list_ports.comports():
+                        if p.device == ports[0]:
+                            vid = getattr(p, "vid", None)
+                            desc = str(getattr(p, "description", ""))
+                            txt = f"{p.device} {desc}".lower()
+                            best_score = (10 if vid in {0x10C4,0x1A86,0x0403,0x303A} else 0) + (5 if any(k in txt for k in ("esp32","espressif","cp210","ch340")) else 0)
+                            break
+                if best_score == 0 and len(ports) > 1:
+                    print(f"Haptics: multiple serial ports found {ports}; set HAPTIC_SERIAL_PORT explicitly")
+                    return False
+            port = ports[0]
+        else:
+            port = str(HAPTIC_SERIAL_PORT)
+
+        try:
+            self.ser = serial.Serial(
+                port=port,
+                baudrate=HAPTIC_BAUD,
+                timeout=HAPTIC_SERIAL_TIMEOUT_S,
+                write_timeout=HAPTIC_SERIAL_TIMEOUT_S,
+            )
+            time.sleep(0.20)
+            print(f"Haptics: connected -> {port}")
+            return True
+        except Exception as exc:
+            self.ser = None
+            print(f"Haptics: serial connection failed on {port}: {type(exc).__name__}: {exc}")
+            return False
+
+    @staticmethod
+    def _direction(direction):
+        key = str(direction or "front").strip().lower()
+        return HAPTIC_DIRECTION_MAP.get(key, "FRONT")
+
+    def update(self, bucket, direction, motion_state):
+        """Apply the user's interaction design.
+
+        CRITICAL -> haptic always.
+        HIGH/MEDIUM -> haptic only while not moving.
+        LOW -> haptic only while not moving.
+        Moving object -> no haptic; speech layer handles the moving-object narration.
+        """
+        if not self.enabled:
+            return
+
+        bucket = str(bucket).upper()
+        motion = str(motion_state or "stationary").lower()
+        moving = motion != "stationary"
+
+        if bucket == "CRITICAL":
+            active = True
+        elif moving:
+            active = False
+        elif bucket in {"HIGH", "MEDIUM", "LOW"}:
+            active = True
+        else:
+            active = False
+
+        mode = bucket if active else "OFF"
+        mapped_direction = self._direction(direction) if active else "FRONT"
+        command = f"HAPTIC,{mode},{mapped_direction}"
+
+        with self.lock:
+            if command == self.last_command:
+                return
+            self.last_command = command
+
+        if not self._ensure_connected():
+            return
+        try:
+            self.ser.write((command + "\n").encode("ascii", errors="ignore"))
+        except Exception as exc:
+            print(f"Haptics: write failed: {type(exc).__name__}: {exc}")
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+
+    def stop(self):
+        if not self.enabled:
+            return
+        try:
+            if self._ensure_connected():
+                self.ser.write(b"HAPTIC,OFF,FRONT\n")
+        except Exception:
+            pass
+        try:
+            if self.ser is not None:
+                self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+
 
 
 
@@ -304,159 +454,6 @@ def _sapi_worker(request_queue, result_queue, voice_name, rate, volume):
             pass
 
 
-class HapticManager:
-    """Non-blocking serial bridge from Python navigation state to the ESP32 haptic controller."""
-
-    def __init__(self):
-        self.enabled = bool(HAPTIC_ENABLED and serial is not None)
-        self.ser = None
-        self.last_command = None
-        self.last_attempt = 0.0
-        self.lock = threading.Lock()
-        if HAPTIC_ENABLED and serial is None:
-            print("Haptics: pyserial not installed | run: python -m pip install pyserial")
-        elif HAPTIC_ENABLED:
-            print(f"Haptics: enabled | serial={HAPTIC_SERIAL_PORT} | baud={HAPTIC_BAUD}")
-        else:
-            print("Haptics: disabled")
-
-    @staticmethod
-    def _port_candidates():
-        if list_ports is None:
-            return []
-        candidates = []
-        for p in list_ports.comports():
-            text = " ".join(
-                str(x or "") for x in (p.device, p.description, p.manufacturer, p.product)
-            ).lower()
-            vid = getattr(p, "vid", None)
-            # Common ESP32 USB-UART/native-USB identifiers. This is only a preference;
-            # AUTO will fall back to any available serial port if there is exactly one.
-            preferred_vids = {0x10C4, 0x1A86, 0x0403, 0x303A}
-            score = 0
-            if vid in preferred_vids:
-                score += 10
-            if "espressif" in text or "esp32" in text or "cp210" in text or "ch340" in text:
-                score += 5
-            candidates.append((score, p.device))
-        candidates.sort(reverse=True)
-        return [device for _score, device in candidates]
-
-    def _ensure_connected(self):
-        if not self.enabled:
-            return False
-        now = time.monotonic()
-        if self.ser is not None and getattr(self.ser, "is_open", False):
-            return True
-        if now - self.last_attempt < HAPTIC_RECONNECT_S:
-            return False
-        self.last_attempt = now
-
-        if str(HAPTIC_SERIAL_PORT).upper() == "AUTO":
-            ports = self._port_candidates()
-            if not ports:
-                return False
-            if len(ports) > 1 and ports[0] is not None:
-                # Prefer the best-scored candidate. If all scores are tied and
-                # several ports exist, print them so the user can set the port explicitly.
-                best_score = 0
-                if list_ports is not None:
-                    for p in list_ports.comports():
-                        if p.device == ports[0]:
-                            vid = getattr(p, "vid", None)
-                            desc = str(getattr(p, "description", ""))
-                            txt = f"{p.device} {desc}".lower()
-                            best_score = (10 if vid in {0x10C4,0x1A86,0x0403,0x303A} else 0) + (5 if any(k in txt for k in ("esp32","espressif","cp210","ch340")) else 0)
-                            break
-                if best_score == 0 and len(ports) > 1:
-                    print(f"Haptics: multiple serial ports found {ports}; set HAPTIC_SERIAL_PORT explicitly")
-                    return False
-            port = ports[0]
-        else:
-            port = str(HAPTIC_SERIAL_PORT)
-
-        try:
-            self.ser = serial.Serial(
-                port=port,
-                baudrate=HAPTIC_BAUD,
-                timeout=HAPTIC_SERIAL_TIMEOUT_S,
-                write_timeout=HAPTIC_SERIAL_TIMEOUT_S,
-            )
-            time.sleep(0.20)
-            print(f"Haptics: connected -> {port}")
-            return True
-        except Exception as exc:
-            self.ser = None
-            print(f"Haptics: serial connection failed on {port}: {type(exc).__name__}: {exc}")
-            return False
-
-    @staticmethod
-    def _direction(direction):
-        key = str(direction or "front").strip().lower()
-        return HAPTIC_DIRECTION_MAP.get(key, "FRONT")
-
-    def update(self, bucket, direction, motion_state):
-        """Apply the user's interaction design.
-
-        CRITICAL -> 100% haptic, always.
-        HIGH -> 75% haptic while not moving.
-        MEDIUM -> 50% haptic while not moving.
-        LOW -> 30% haptic while not moving.
-        Moving object -> no haptic; speech layer handles the moving-object narration.
-        """
-        if not self.enabled:
-            return
-
-        bucket = str(bucket).upper()
-        motion = str(motion_state or "stationary").lower()
-        moving = motion != "stationary"
-
-        if bucket == "CRITICAL":
-            active = True
-        elif moving:
-            active = False
-        elif bucket in {"HIGH", "MEDIUM", "LOW"}:
-            active = True
-        else:
-            active = False
-
-        mode = bucket if active else "OFF"
-        mapped_direction = self._direction(direction) if active else "FRONT"
-        command = f"HAPTIC,{mode},{mapped_direction}"
-
-        with self.lock:
-            if command == self.last_command:
-                return
-            self.last_command = command
-
-        if not self._ensure_connected():
-            return
-        try:
-            self.ser.write((command + "\n").encode("ascii", errors="ignore"))
-        except Exception as exc:
-            print(f"Haptics: write failed: {type(exc).__name__}: {exc}")
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-            self.ser = None
-
-    def stop(self):
-        if not self.enabled:
-            return
-        try:
-            if self._ensure_connected():
-                self.ser.write(b"HAPTIC,OFF,FRONT\n")
-        except Exception:
-            pass
-        try:
-            if self.ser is not None:
-                self.ser.close()
-        except Exception:
-            pass
-        self.ser = None
-
-
 class DisplayThrottler:
     """Throttle UI refresh slightly, but NEVER pause video because of TTS."""
     def __init__(self):
@@ -555,15 +552,21 @@ class SpeechManager:
         unit = match.group(0).lower()
         return value / 100.0 if ("cm" in unit or "centimeter" in unit) else value
 
-    def _transition_message(self, message):
-        """Add a varied, concise emergency lead-in; never use 'Pardon'."""
+    def _transition_message(self, message, allow_stop=True):
+        """Add a varied emergency lead-in while respecting travel direction."""
         text = str(message).strip()
         if not text:
             return text
 
+        # Rear hazards and front hazards that are already moving away must not
+        # receive a generic STOP lead-in: stopping in the wrong situation can
+        # increase collision risk.
+        if not allow_stop:
+            return text
+
         # Only add a transition when the new message does not already have one.
         if re.match(
-            r"^(stop|stop now|hold|do not advance|urgent|immediate danger|careful)[,.!? ]",
+            r"^(stop|stop now|do not advance|urgent|immediate danger|careful|stay|continue)[,.!? ]",
             text,
             re.IGNORECASE,
         ):
@@ -571,8 +574,6 @@ class SpeechManager:
 
         leads = (
             "Stop now. ",
-            "Hold. ",
-            "Do not advance. ",
             "Immediate danger. ",
             "Careful. ",
         )
@@ -782,31 +783,24 @@ class SpeechManager:
                     self.active_item = None
 
     def _direction(self, selected, frame_width, unknown_zone=""):
-        """Return only the four physical haptic/speech directions used by the wearable.
-
-        Center visual objects map to FRONT; left/right visual objects map to
-        FRONT-LEFT/FRONT-RIGHT. Rear ultrasonic tracks map to BACK. Placeholder
-        values such as ``none`` are ignored so strings like ``none-right`` can
-        never reach speech or haptics.
-        """
         if selected is None:
-            return "front"
-
+            return "ahead"
         box = getattr(selected, "box", None)
         if box is None:
-            source = str(getattr(selected, "source", "")).strip().lower()
-            if "rear" in source or "back" in source:
+            source = str(getattr(selected, "source", "")).upper()
+            if "REAR" in source or "BACK" in source:
                 return "back"
             return "front"
-
         cx = (float(box[0]) + float(box[2])) / 2.0
-        frac = cx / max(float(frame_width), 1.0)
-
-        if frac < 0.33:
-            return "front-left"
-        if frac > 0.67:
-            return "front-right"
-        return "front"
+        if cx < frame_width * 0.33:
+            side = "left"
+        elif cx > frame_width * 0.67:
+            side = "right"
+        else:
+            side = "center"
+        if unknown_zone:
+            return f"{unknown_zone}-{side}" if side != "center" else unknown_zone
+        return side
 
     def request(self, final_bucket, selected, frame_width, unknown_zone="", forced_direction=None):
         if not SPEECH_ENABLED or not self.running:
@@ -832,18 +826,26 @@ class SpeechManager:
             self.direction_candidate = direction; self.direction_candidate_since = now
         elif now - self.direction_candidate_since < SPEECH_DIRECTION_STABLE_S and bucket == self.last_bucket:
             return
-        message = self.deterministic_fallback_message(bucket, direction)
+        motion_state = "stationary"
+        message = ""
         distance = None; ttc = None; track_key = None
         if selected is not None:
             track_key = getattr(selected, "track_id", id(selected))
             try:
-                distance = float(getattr(selected, "distance_m", float("nan")))
+                distance = float(getattr(selected, "distance_m", getattr(selected, "smoothed_dist", float("nan"))))
                 if not math.isfinite(distance) or distance <= 0: distance = None
             except Exception: distance = None
+            try:
+                raw_cs = float(selected.closing_speed())
+                motion_state = closing_motion_state(raw_cs)
+            except Exception:
+                motion_state = "stationary"
             try:
                 ttc = float(selected.ttc())
                 if not math.isfinite(ttc) or ttc <= 0: ttc = None
             except Exception: ttc = None
+
+        message = self.deterministic_fallback_message(bucket, direction, motion_state)
         item = (speech_friendly_units(message), bucket, direction, distance, ttc, track_key)
 
         # A real CRITICAL message takes ownership of speech immediately.
@@ -867,7 +869,19 @@ class SpeechManager:
                 return
             self.last_interrupt_time = now
             print(f"Speech: interrupt -> {item[0]}")
-            item = (self._transition_message(item[0]), item[1], item[2], item[3], item[4], item[5])
+            allow_stop_transition = (
+                str(item[2]).lower() not in {"back", "rear"}
+            )
+            if active_item is not None and str(item[2]).lower() not in {"back", "rear"}:
+                try:
+                    active_motion = closing_motion_state(float(getattr(selected, "closing_speed")()))
+                except Exception:
+                    active_motion = "stationary"
+                allow_stop_transition = allow_stop_transition and active_motion != "moving away"
+            item = (
+                self._transition_message(item[0], allow_stop=allow_stop_transition),
+                item[1], item[2], item[3], item[4], item[5]
+            )
             self._cancel_active()
         elif not self._allow_stable_repeat(item):
             return
@@ -969,12 +983,18 @@ class SpeechManager:
         # Use the single project-wide speech distance policy.
         spoken_distance = format_spoken_distance(distance)
 
-        ttc_options = (
-            f"Stop. Fast approaching obstacle {spoken_distance} on your {direction}.",
-            f"Immediate danger. Obstacle {spoken_distance} on your {direction}, closing fast.",
-            f"Do not advance. Fast-moving obstacle {spoken_distance} on your {direction}.",
-            f"Hold position. Collision risk {spoken_distance} on your {direction}.",
-        )
+        if str(direction).lower() in {"back", "rear"}:
+            ttc_options = (
+                f"Fast approaching obstacle {spoken_distance} behind you. Move forward if the path is clear.",
+                f"Immediate danger behind you at {spoken_distance}. Keep moving forward if clear.",
+                f"Obstacle {spoken_distance} behind you, closing fast. Move forward if clear.",
+            )
+        else:
+            ttc_options = (
+                f"Stop. Fast approaching obstacle {spoken_distance} on your {direction}.",
+                f"Immediate danger. Obstacle {spoken_distance} on your {direction}, closing fast.",
+                f"Do not move forward. Fast-moving obstacle {spoken_distance} on your {direction}.",
+            )
         ttc_index = (int(time.monotonic() * 10) + (track_key or 0)) % len(ttc_options)
         text = ttc_options[ttc_index]
         item = (speech_friendly_units(text), "CRITICAL", direction, float(distance) if distance > 0 else None, float(ttc) if ttc > 0 else None, track_key)
@@ -985,7 +1005,11 @@ class SpeechManager:
                 return False
             self.last_interrupt_time = now
             print(f"Speech: interrupt -> {item[0]}")
-            item = (self._transition_message(item[0]), item[1], item[2], item[3], item[4], item[5])
+            allow_stop_transition = str(direction).lower() not in {"back", "rear"}
+            item = (
+                self._transition_message(item[0], allow_stop=allow_stop_transition),
+                item[1], item[2], item[3], item[4], item[5]
+            )
             self._cancel_active()
         # This is now a confirmed TTC emergency. Invalidate only Groq calls
         # that were already in flight; do not impose a blanket speech blackout.
@@ -1093,18 +1117,65 @@ class SpeechManager:
         except Exception:
             pass
 
-    def deterministic_fallback_message(self, bucket, direction):
-        """Generate varied fallback guidance without repeating the same opening."""
+    def deterministic_fallback_message(self, bucket, direction, motion_state="stationary"):
+        """Generate safe, varied fallback guidance for the obstacle's actual travel direction."""
         bucket = str(bucket).upper()
-        direction = str(direction or "ahead")
+        direction = str(direction or "ahead").lower()
+        motion_state = str(motion_state or "stationary").lower()
+        moving_away = motion_state == "moving away"
+        rear = direction in {"back", "rear"}
 
-        if bucket == "CRITICAL":
+        # Rear approach: do NOT tell the user to stop. A static/approaching
+        # rear obstacle needs a forward-oriented instruction, but only
+        # conditionally because front free-space was not measured.
+        if rear:
+            if bucket == "CRITICAL":
+                options = [
+                    "Immediate danger behind you. Keep moving forward if the path is clear.",
+                    "Obstacle very close behind you. Move forward if clear.",
+                    "Critical obstacle behind you. Keep moving forward if clear.",
+                ]
+            elif bucket == "HIGH":
+                options = [
+                    "Obstacle behind you. Keep moving forward if the path is clear.",
+                    "Obstacle close behind you. Stay aware and move forward if clear.",
+                    "Caution behind you. Keep moving forward if clear.",
+                ]
+            elif bucket == "MEDIUM":
+                options = [
+                    "Caution. Obstacle behind you.",
+                    "Watch behind you. Move carefully.",
+                    "Obstacle behind you. Stay aware.",
+                ]
+            else:
+                return ""
+        elif moving_away:
+            # Front/side obstacle moving away: no immediate STOP command.
+            if bucket == "CRITICAL":
+                options = [
+                    f"Obstacle {direction} is moving away. Continue carefully.",
+                    f"Critical obstacle {direction} is moving away. Continue with caution.",
+                    f"Obstacle very close {direction}, moving away. Continue carefully.",
+                ]
+            elif bucket == "HIGH":
+                options = [
+                    f"Obstacle {direction} is moving away. Keep clear and continue carefully.",
+                    f"Obstacle close {direction}, moving away. Continue with caution.",
+                    f"Watch your path {direction}. The obstacle is moving away.",
+                ]
+            elif bucket == "MEDIUM":
+                options = [
+                    f"Caution. Obstacle {direction} is moving away.",
+                    f"Watch your path {direction}; the obstacle is moving away.",
+                    f"Obstacle {direction} is moving away. Continue carefully.",
+                ]
+            else:
+                return ""
+        elif bucket == "CRITICAL":
             options = [
                 f"Stop now. Critical obstacle {direction}.",
-                f"Hold. Critical obstacle {direction}.",
-                f"Do not advance. Collision danger {direction}.",
-                f"Immediate danger {direction}. Hold position.",
-                f"Careful. Critical obstacle very close {direction}.",
+                f"Immediate danger {direction}. Do not move forward.",
+                f"Critical obstacle very close {direction}. Stop now.",
             ]
         elif bucket == "HIGH":
             options = [
@@ -1124,7 +1195,7 @@ class SpeechManager:
 
         # Stable but varied selection based on the event state, avoiding a
         # random choice that could make repeated warnings unpredictable.
-        key = f"{bucket}|{direction}|{self.last_message or ''}|{time.monotonic():.1f}"
+        key = f"{bucket}|{direction}|{motion_state}|{self.last_message or ''}|{time.monotonic():.1f}"
         index = hash(key) % len(options)
         return speech_friendly_units(options[index])
 
@@ -1356,13 +1427,16 @@ STYLE:
 - Do NOT start every HIGH warning with "Stop".
 - HIGH should sound varied and natural: "Caution...", "Obstacle close...", "Watch your path...", "Keep clear...", "Slow down..."
 - HIGH may use a conditional countermeasure when it helps: e.g. "Obstacle front-left at 50 centimetres; move slightly right if clear."
-- CRITICAL must be urgent and should normally begin with "Stop".
+- CRITICAL in the FRONT normally requires an urgent stop instruction when the obstacle is approaching.
+- CRITICAL at the BACK must NEVER tell the user to stop. Say that the hazard is behind them and use a conditional forward instruction such as "move forward if the path is clear."
+- A front obstacle that is moving away must NOT trigger an immediate stop instruction merely because it is close. Use "moving away" and continue cautiously unless the supplied state explicitly requires otherwise.
 - MEDIUM should normally begin with "Caution" or "Watch your path".
 - Avoid repeating the same sentence structure for consecutive events.
 - Mention the object when known. Say "unknown object" when that is the object label.
 - Include distance and direction whenever available.
-- If the object is moving away, you can say "moving away" but do not overemphasize it.
+- If the object is moving away, say "moving away" and do not call it approaching.
 - Never say "stationary".
+- Never use the phrase "take position" or militaristic wording such as "hold position".
 
 Risk: {ctx['bucket']}
 Object: {ctx['object']}
@@ -1406,14 +1480,39 @@ TTC: {ttc_text}
             opening = openings[selector]
             if not text.lower().startswith(tuple(o.lower().strip() for o in openings)):
                 text = opening + text[:1].lower() + text[1:] if text else opening.strip()
+        # Remove unnatural/militaristic wording even if the LLM ignores the prompt.
+        text = re.sub(r"\btake\s+position\b", "move carefully", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bhold\s+position\b", "stay where you are", text, flags=re.IGNORECASE)
+
         # Enforce the signed motion state after the LLM response so a negative
         # closing speed can never be described as approaching.
         state = self._approach_state(ctx["closing_speed"])
+
+        # Rear hazards must never become a STOP instruction, even after the LLM response.
+        if str(ctx["direction"]).lower() in {"back", "rear"}:
+            text = re.sub(
+                r"\b(?:stop|stop now|do not advance|hold|do not move forward)\b[.!,:;\-]*\s*",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if not re.search(r"\b(?:move forward|keep moving forward)\b", text, flags=re.IGNORECASE):
+                text = text.rstrip(" .") + " Move forward if the path is clear."
+
         if state == "moving away":
             # Do not rely on the LLM to volunteer the movement state. If the
             # signed speed is negative, enforce the phrase in the final text.
             text = re.sub(r"\bapproaching\b", "moving away", text, flags=re.IGNORECASE)
             text = re.sub(r"\bclosing\b", "moving away", text, flags=re.IGNORECASE)
+            # A front/side moving-away obstacle should not inherit a generic
+            # STOP command just because the risk bucket is high.
+            if str(ctx["direction"]).lower() not in {"back", "rear"}:
+                text = re.sub(
+                    r"\b(?:stop|stop now|do not advance|do not move forward)\b[.!,:;\-]*\s*",
+                    "",
+                    text,
+                    flags=re.IGNORECASE,
+                )
             if not re.search(r"\bmoving away\b", text, flags=re.IGNORECASE):
                 speed = abs(float(ctx["closing_speed"]))
                 speed_spoken = (
@@ -1421,12 +1520,23 @@ TTC: {ttc_text}
                     if speed < 1.0 else f"{speed:.2f} meters per second"
                 )
                 text = text.rstrip(" .") + f", moving away at {speed_spoken}."
+
         elif state == "stationary":
             # Stationary is the implicit/default state. Do not make the user
             # listen to an unnecessary movement label. Remove common movement
             # phrases while preserving the useful object/distance/direction text.
-            text = re.sub(r",?\s*(?:which is |that is )?(?:currently )?(?:stationary|not moving)\b", "", text, flags=re.IGNORECASE)
-            text = re.sub(r",?\s*(?:currently )?(?:approaching|closing|moving away)\b(?:\s+at\s+[-+]?\d+(?:\.\d+)?\s*(?:meters?|centimeters?)\s+per\s+second)?", "", text, flags=re.IGNORECASE)
+            text = re.sub(
+                r",?\s*(?:which is |that is )?(?:currently )?(?:stationary|not moving)\b",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            )
+            text = re.sub(
+                r",?\s*(?:currently )?(?:approaching|closing|moving away)\b(?:\s+at\s+[-+]?\d+(?:\.\d+)?\s*(?:meters?|centimeters?)\s+per\s+second)?",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            )
             text = re.sub(r"\s{2,}", " ", text).strip()
         return text
 
@@ -1442,7 +1552,11 @@ TTC: {ttc_text}
             if not self.enabled or self.client is None:
                 direction = ctx["direction"]
                 self.speech.request_message(
-                    self.speech.deterministic_fallback_message(ctx["bucket"], direction),
+                    self.speech.deterministic_fallback_message(
+                        ctx["bucket"],
+                        direction,
+                        ctx.get("approach_state", "stationary"),
+                    ),
                     ctx["bucket"],
                     direction,
                 )
@@ -4919,16 +5033,20 @@ def main():
             # closing speed and class proxy. Keep the safety floor as an
             # additional guard, but do not overwrite those measurements.
             # ---------------------------------------------------------
-            # HAPTIC + AUDIO / LLM NAVIGATION LAYER
+            # HAPTIC OUTPUT LAYER
+            # Match the user's interaction design: low/medium/high/critical
+            # haptic when the selected object is not moving; moving objects
+            # are speech-only unless they reach CRITICAL safety state.
+            haptic.update(final_bucket, selected_direction or "front", closing_motion_state(closing_speed))
+
+            # AUDIO / LLM NAVIGATION LAYER
             # ---------------------------------------------------------
-            # Haptic policy requested by the user:
-            #   CRITICAL -> vibration + speech
-            #   HIGH     -> vibration + speech
-            #   MEDIUM   -> vibration + speech
-            #   LOW      -> vibration only
-            #   MOVING   -> no vibration + speech
-            # A moving-object state is treated as an overlay; CRITICAL remains
-            # haptic because emergency safety must not lose the physical alert.
+            # CRITICAL hazards bypass the network and speak immediately.
+            # Other risk levels use event-triggered Groq for concise contextual
+            # guidance; the deterministic sentence is used if Groq is unavailable
+            # or fails.
+            # SpeechManager.request() already handles forced_direction.
+            # _direction() does not accept that argument.
             speech_direction = (
                 selected_direction
                 if selected_direction
@@ -4945,22 +5063,11 @@ def main():
                 )
                 else (selected.ttc() if selected is not None else TTC_SAFE_VALUE)
             )
-
-            if selected is not None:
-                haptic.update(final_bucket, speech_direction, motion_state)
-            else:
-                haptic.update("LOW", "front", "stationary")
-
-            # Low-risk stationary objects are deliberately silent in speech.
-            # Moving objects are deliberately speech-only unless CRITICAL.
-            moving_object = motion_state != "stationary"
-            speech_should_run = (
-                final_bucket in {"CRITICAL", "HIGH", "MEDIUM"}
-                or (moving_object and selected is not None)
-            )
-
+            # Fast-closing TTC is an independent emergency speech path.
+            # It must fire even when GRU/Groq remains in MEDIUM/HIGH or when
+            # TTC itself briefly fluctuates around a threshold.
             ttc_emergency_spoken = False
-            if selected is not None and final_bucket == "CRITICAL":
+            if selected is not None:
                 ttc_emergency_spoken = speech.request_ttc_alert(
                     selected,
                     w,
@@ -4978,7 +5085,7 @@ def main():
                     unknown_zone=unknown_zone,
                     forced_direction=selected_direction,
                 )
-            elif selected is not None and speech_should_run:
+            elif selected is not None:
                 groq_navigation.request(
                     final_bucket,
                     cls_name if cls_name != "none" else "obstacle",
@@ -4987,20 +5094,16 @@ def main():
                     closing_speed,
                     current_ttc,
                 )
-            elif selected is not None:
-                # LOW stationary: explicitly reset the LLM episode so any prior
-                # pending low-risk narration cannot leak into a silent scene.
-                groq_navigation.reset()
             else:
+                # No selected obstacle: end the current Groq event episode.
                 groq_navigation.reset()
-                if final_bucket in {"CRITICAL", "HIGH", "MEDIUM"}:
-                    speech.request(
-                        final_bucket,
-                        selected,
-                        w,
-                        unknown_zone=unknown_zone,
-                        forced_direction=selected_direction,
-                    )
+                speech.request(
+                    final_bucket,
+                    selected,
+                    w,
+                    unknown_zone=unknown_zone,
+                    forced_direction=selected_direction,
+                )
 
             selected_source = (
                 "VISION OVERRIDE"
@@ -5416,10 +5519,10 @@ def main():
     finally:
         midas_worker.stop()
         reader.release()
-        haptic.stop()
         ultrasonic.stop()
         groq_navigation.stop()
         speech.stop()
+        haptic.stop()
         cv2.destroyAllWindows()
 
 
