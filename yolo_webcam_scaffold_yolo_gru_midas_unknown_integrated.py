@@ -15,7 +15,7 @@ can be more urgent than a slow/stationary object that's physically closer
 (e.g. a pole 2m away). Picking by raw nearest-distance misses this --
 picking by TTC catches it.
 
-Still 100% software -- no new hardware required. YOLO distance uses the
+Still Software + haptic-controller integration; ESP32 drives the external PCA9685/ULN2003 motor hardware. YOLO distance uses the
 existing calibrated bbox-size heuristic. MiDaS-only distance uses raw MiDaS
 inverse-depth with a separate online metric calibration learned from matched
 YOLO+MiDaS objects.
@@ -42,6 +42,13 @@ if os.name == "nt":
 import sys
 import re
 import multiprocessing as mp
+
+try:
+    import serial
+    from serial.tools import list_ports
+except Exception:
+    serial = None
+    list_ports = None
 
 try:
     from groq import Groq
@@ -75,11 +82,34 @@ SPEECH_RIGHT_ZONE_FRAC = 0.66
 # Groq is a secondary natural-language layer. It NEVER makes the safety
 # decision; the deterministic sensor-fusion + GRU path remains authoritative.
 GROQ_ENABLED = True
-GROQ_MODEL = "qwen/qwen3.6-27b"
+GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_TIMEOUT_S = 1.2
 GROQ_MAX_TOKENS = 50
 GROQ_DISTANCE_EVENT_M = 0.60
 GROQ_MIN_EVENT_INTERVAL_S = 2.00
+
+# ---- ESP32 haptic feedback layer ----
+# The ESP32 drives the PCA9685/ULN2003/motor hardware. Python sends only
+# high-level haptic states; the ESP32 generates the local PWM pulse pattern.
+HAPTIC_ENABLED = True
+HAPTIC_SERIAL_PORT = "AUTO"
+HAPTIC_BAUD = 115200
+HAPTIC_SERIAL_TIMEOUT_S = 0.05
+HAPTIC_RECONNECT_S = 2.0
+
+# User's physical motor placement.
+HAPTIC_DIRECTION_MAP = {
+    "front": "FRONT",
+    "ahead": "FRONT",
+    "center": "FRONT",
+    "front-left": "FRONT_LEFT",
+    "left": "FRONT_LEFT",
+    "front-right": "FRONT_RIGHT",
+    "right": "FRONT_RIGHT",
+    "back": "BACK",
+    "rear": "BACK",
+}
+
 
 
 class SpeechPlayback:
@@ -274,6 +304,159 @@ def _sapi_worker(request_queue, result_queue, voice_name, rate, volume):
             pass
 
 
+class HapticManager:
+    """Non-blocking serial bridge from Python navigation state to the ESP32 haptic controller."""
+
+    def __init__(self):
+        self.enabled = bool(HAPTIC_ENABLED and serial is not None)
+        self.ser = None
+        self.last_command = None
+        self.last_attempt = 0.0
+        self.lock = threading.Lock()
+        if HAPTIC_ENABLED and serial is None:
+            print("Haptics: pyserial not installed | run: python -m pip install pyserial")
+        elif HAPTIC_ENABLED:
+            print(f"Haptics: enabled | serial={HAPTIC_SERIAL_PORT} | baud={HAPTIC_BAUD}")
+        else:
+            print("Haptics: disabled")
+
+    @staticmethod
+    def _port_candidates():
+        if list_ports is None:
+            return []
+        candidates = []
+        for p in list_ports.comports():
+            text = " ".join(
+                str(x or "") for x in (p.device, p.description, p.manufacturer, p.product)
+            ).lower()
+            vid = getattr(p, "vid", None)
+            # Common ESP32 USB-UART/native-USB identifiers. This is only a preference;
+            # AUTO will fall back to any available serial port if there is exactly one.
+            preferred_vids = {0x10C4, 0x1A86, 0x0403, 0x303A}
+            score = 0
+            if vid in preferred_vids:
+                score += 10
+            if "espressif" in text or "esp32" in text or "cp210" in text or "ch340" in text:
+                score += 5
+            candidates.append((score, p.device))
+        candidates.sort(reverse=True)
+        return [device for _score, device in candidates]
+
+    def _ensure_connected(self):
+        if not self.enabled:
+            return False
+        now = time.monotonic()
+        if self.ser is not None and getattr(self.ser, "is_open", False):
+            return True
+        if now - self.last_attempt < HAPTIC_RECONNECT_S:
+            return False
+        self.last_attempt = now
+
+        if str(HAPTIC_SERIAL_PORT).upper() == "AUTO":
+            ports = self._port_candidates()
+            if not ports:
+                return False
+            if len(ports) > 1 and ports[0] is not None:
+                # Prefer the best-scored candidate. If all scores are tied and
+                # several ports exist, print them so the user can set the port explicitly.
+                best_score = 0
+                if list_ports is not None:
+                    for p in list_ports.comports():
+                        if p.device == ports[0]:
+                            vid = getattr(p, "vid", None)
+                            desc = str(getattr(p, "description", ""))
+                            txt = f"{p.device} {desc}".lower()
+                            best_score = (10 if vid in {0x10C4,0x1A86,0x0403,0x303A} else 0) + (5 if any(k in txt for k in ("esp32","espressif","cp210","ch340")) else 0)
+                            break
+                if best_score == 0 and len(ports) > 1:
+                    print(f"Haptics: multiple serial ports found {ports}; set HAPTIC_SERIAL_PORT explicitly")
+                    return False
+            port = ports[0]
+        else:
+            port = str(HAPTIC_SERIAL_PORT)
+
+        try:
+            self.ser = serial.Serial(
+                port=port,
+                baudrate=HAPTIC_BAUD,
+                timeout=HAPTIC_SERIAL_TIMEOUT_S,
+                write_timeout=HAPTIC_SERIAL_TIMEOUT_S,
+            )
+            time.sleep(0.20)
+            print(f"Haptics: connected -> {port}")
+            return True
+        except Exception as exc:
+            self.ser = None
+            print(f"Haptics: serial connection failed on {port}: {type(exc).__name__}: {exc}")
+            return False
+
+    @staticmethod
+    def _direction(direction):
+        key = str(direction or "front").strip().lower()
+        return HAPTIC_DIRECTION_MAP.get(key, "FRONT")
+
+    def update(self, bucket, direction, motion_state):
+        """Apply the user's interaction design.
+
+        CRITICAL -> 100% haptic, always.
+        HIGH -> 75% haptic while not moving.
+        MEDIUM -> 50% haptic while not moving.
+        LOW -> 30% haptic while not moving.
+        Moving object -> no haptic; speech layer handles the moving-object narration.
+        """
+        if not self.enabled:
+            return
+
+        bucket = str(bucket).upper()
+        motion = str(motion_state or "stationary").lower()
+        moving = motion != "stationary"
+
+        if bucket == "CRITICAL":
+            active = True
+        elif moving:
+            active = False
+        elif bucket in {"HIGH", "MEDIUM", "LOW"}:
+            active = True
+        else:
+            active = False
+
+        mode = bucket if active else "OFF"
+        mapped_direction = self._direction(direction) if active else "FRONT"
+        command = f"HAPTIC,{mode},{mapped_direction}"
+
+        with self.lock:
+            if command == self.last_command:
+                return
+            self.last_command = command
+
+        if not self._ensure_connected():
+            return
+        try:
+            self.ser.write((command + "\n").encode("ascii", errors="ignore"))
+        except Exception as exc:
+            print(f"Haptics: write failed: {type(exc).__name__}: {exc}")
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+
+    def stop(self):
+        if not self.enabled:
+            return
+        try:
+            if self._ensure_connected():
+                self.ser.write(b"HAPTIC,OFF,FRONT\n")
+        except Exception:
+            pass
+        try:
+            if self.ser is not None:
+                self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+
+
 class DisplayThrottler:
     """Throttle UI refresh slightly, but NEVER pause video because of TTS."""
     def __init__(self):
@@ -298,7 +481,7 @@ class DisplayThrottler:
             safe_imshow(window_name, frame)
 
 class SpeechManager:
-    """Speech arbitration with persistent Piper and urgency-aware interruption."""
+    """Speech arbitration with Windows SAPI and urgency-aware interruption."""
 
     _SEVERITY = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 
@@ -332,6 +515,13 @@ class SpeechManager:
         # Per-track repetition state. A stable obstacle is not announced every frame.
         self.repeat_state = {}
         self.last_interrupt_time = 0.0
+        # After a CRITICAL/TTC warning, suppress stale non-critical Groq
+        # responses briefly so an in-flight LLM result cannot re-enter the
+        # queue after the emergency message has taken control.
+        # Monotonic emergency generation. Groq responses that were already
+        # in flight when a real CRITICAL/TTC event occurred are discarded,
+        # while genuinely new events after the emergency are still allowed.
+        self.critical_epoch = 0
 
         # Windows SAPI runs in a dedicated low-priority process.
         self.sapi_request_queue = mp.Queue(maxsize=1)
@@ -592,24 +782,31 @@ class SpeechManager:
                     self.active_item = None
 
     def _direction(self, selected, frame_width, unknown_zone=""):
+        """Return only the four physical haptic/speech directions used by the wearable.
+
+        Center visual objects map to FRONT; left/right visual objects map to
+        FRONT-LEFT/FRONT-RIGHT. Rear ultrasonic tracks map to BACK. Placeholder
+        values such as ``none`` are ignored so strings like ``none-right`` can
+        never reach speech or haptics.
+        """
         if selected is None:
-            return "ahead"
+            return "front"
+
         box = getattr(selected, "box", None)
         if box is None:
-            source = str(getattr(selected, "source", "")).upper()
-            if "REAR" in source or "BACK" in source:
+            source = str(getattr(selected, "source", "")).strip().lower()
+            if "rear" in source or "back" in source:
                 return "back"
             return "front"
+
         cx = (float(box[0]) + float(box[2])) / 2.0
-        if cx < frame_width * 0.33:
-            side = "left"
-        elif cx > frame_width * 0.67:
-            side = "right"
-        else:
-            side = "center"
-        if unknown_zone:
-            return f"{unknown_zone}-{side}" if side != "center" else unknown_zone
-        return side
+        frac = cx / max(float(frame_width), 1.0)
+
+        if frac < 0.33:
+            return "front-left"
+        if frac > 0.67:
+            return "front-right"
+        return "front"
 
     def request(self, final_bucket, selected, frame_width, unknown_zone="", forced_direction=None):
         if not SPEECH_ENABLED or not self.running:
@@ -649,6 +846,10 @@ class SpeechManager:
             except Exception: ttc = None
         item = (speech_friendly_units(message), bucket, direction, distance, ttc, track_key)
 
+        # A real CRITICAL message takes ownership of speech immediately.
+        # Increment the emergency generation only when this CRITICAL alert is
+        # actually accepted, so ordinary TTC polling does not suppress speech.
+
         # If a TTC emergency for this same track was just announced, suppress
         # the generic CRITICAL sentence during the TTC cooldown. Otherwise the
         # next frame can queue a second CRITICAL warning immediately.
@@ -661,7 +862,8 @@ class SpeechManager:
         if active:
             if not self._should_interrupt(active_item, item):
                 return
-            if now - self.last_interrupt_time < SPEECH_INTERRUPT_COOLDOWN_S:
+            # CRITICAL is never delayed by the ordinary interruption cooldown.
+            if bucket != "CRITICAL" and now - self.last_interrupt_time < SPEECH_INTERRUPT_COOLDOWN_S:
                 return
             self.last_interrupt_time = now
             print(f"Speech: interrupt -> {item[0]}")
@@ -670,6 +872,8 @@ class SpeechManager:
         elif not self._allow_stable_repeat(item):
             return
         with self.lock:
+            if bucket == "CRITICAL":
+                self.critical_epoch += 1
             self.last_bucket = bucket; self.last_direction = direction; self.last_message = item[0]
         self._queue_latest(item, log_prefix="Speech: queued")
 
@@ -777,12 +981,16 @@ class SpeechManager:
         with self.lock:
             active_item = self.active_item; active = bool(self.active_playback)
         if active:
-            if not self._should_interrupt(active_item, item) or now - self.last_interrupt_time < SPEECH_INTERRUPT_COOLDOWN_S:
+            if not self._should_interrupt(active_item, item):
                 return False
             self.last_interrupt_time = now
             print(f"Speech: interrupt -> {item[0]}")
             item = (self._transition_message(item[0]), item[1], item[2], item[3], item[4], item[5])
             self._cancel_active()
+        # This is now a confirmed TTC emergency. Invalidate only Groq calls
+        # that were already in flight; do not impose a blanket speech blackout.
+        with self.lock:
+            self.critical_epoch += 1
         alert_state["count"] += 1
         alert_state["last"] = now
         self.object_alert_counts[track_key] = alert_state
@@ -853,13 +1061,11 @@ class SpeechManager:
                 if any(old[0] == item[0] for old in existing):
                     return
 
-                # CRITICAL alerts are preserved. For ordinary messages, remove
-                # older non-critical items so stale warnings cannot build up.
+                # A new CRITICAL alert owns the queue: purge every stale
+                # pending sentence, including older critical wording.
                 kept = []
                 if new_sev >= self._SEVERITY["CRITICAL"]:
-                    for old in existing:
-                        if str(old[1]).upper() == "CRITICAL":
-                            kept.append(old)
+                    kept = []
                 else:
                     # Keep at most one existing CRITICAL; otherwise keep none.
                     for old in existing:
@@ -1173,7 +1379,7 @@ TTC: {ttc_text}
             messages=[{"role": "user", "content": self._prompt(ctx)}],
             temperature=0,
             max_tokens=GROQ_MAX_TOKENS,
-            reasoning_effort="none",
+            reasoning_effort="low",
         )
         text = response.choices[0].message.content.strip()
 
@@ -1243,6 +1449,8 @@ TTC: {ttc_text}
                 continue
 
             try:
+                with self.lock:
+                    request_critical_epoch = self.speech.critical_epoch
                 message = self._call_groq(ctx)
                 if not message:
                     raise RuntimeError("empty Groq response")
@@ -1251,7 +1459,11 @@ TTC: {ttc_text}
                 # moved to a different obstacle or to a safe scene.  Never speak
                 # a response for an obsolete scene snapshot.
                 with self.lock:
-                    still_current = (self.last_context == ctx and self.pending is None)
+                    still_current = (
+                        self.last_context == ctx
+                        and self.pending is None
+                        and self.speech.critical_epoch == request_critical_epoch
+                    )
                 if not still_current:
                     print("Groq: stale response discarded")
                     continue
@@ -1261,7 +1473,11 @@ TTC: {ttc_text}
             except Exception as exc:
                 print(f"Groq ERROR: {exc}")
                 with self.lock:
-                    still_current = (self.last_context == ctx and self.pending is None)
+                    still_current = (
+                        self.last_context == ctx
+                        and self.pending is None
+                        and self.speech.critical_epoch == request_critical_epoch
+                    )
                 if not still_current:
                     print("Groq: stale fallback discarded")
                     continue
@@ -3557,6 +3773,7 @@ def main():
     reader = LatestFrameReader(SOURCE)
     ultrasonic = UltrasonicReceiver(host="0.0.0.0", port=4210)
     speech = SpeechManager()
+    haptic = HapticManager()
     display_throttler = DisplayThrottler()
     groq_navigation = GroqNavigationManager(speech)
 
@@ -4702,14 +4919,16 @@ def main():
             # closing speed and class proxy. Keep the safety floor as an
             # additional guard, but do not overwrite those measurements.
             # ---------------------------------------------------------
-            # AUDIO / LLM NAVIGATION LAYER
+            # HAPTIC + AUDIO / LLM NAVIGATION LAYER
             # ---------------------------------------------------------
-            # CRITICAL hazards bypass the network and speak immediately.
-            # Other risk levels use event-triggered Groq for concise contextual
-            # guidance; the deterministic sentence is used if Groq is unavailable
-            # or fails.
-            # SpeechManager.request() already handles forced_direction.
-            # _direction() does not accept that argument.
+            # Haptic policy requested by the user:
+            #   CRITICAL -> vibration + speech
+            #   HIGH     -> vibration + speech
+            #   MEDIUM   -> vibration + speech
+            #   LOW      -> vibration only
+            #   MOVING   -> no vibration + speech
+            # A moving-object state is treated as an overlay; CRITICAL remains
+            # haptic because emergency safety must not lose the physical alert.
             speech_direction = (
                 selected_direction
                 if selected_direction
@@ -4726,11 +4945,22 @@ def main():
                 )
                 else (selected.ttc() if selected is not None else TTC_SAFE_VALUE)
             )
-            # Fast-closing TTC is an independent emergency speech path.
-            # It must fire even when GRU/Groq remains in MEDIUM/HIGH or when
-            # TTC itself briefly fluctuates around a threshold.
-            ttc_emergency_spoken = False
+
             if selected is not None:
+                haptic.update(final_bucket, speech_direction, motion_state)
+            else:
+                haptic.update("LOW", "front", "stationary")
+
+            # Low-risk stationary objects are deliberately silent in speech.
+            # Moving objects are deliberately speech-only unless CRITICAL.
+            moving_object = motion_state != "stationary"
+            speech_should_run = (
+                final_bucket in {"CRITICAL", "HIGH", "MEDIUM"}
+                or (moving_object and selected is not None)
+            )
+
+            ttc_emergency_spoken = False
+            if selected is not None and final_bucket == "CRITICAL":
                 ttc_emergency_spoken = speech.request_ttc_alert(
                     selected,
                     w,
@@ -4748,7 +4978,7 @@ def main():
                     unknown_zone=unknown_zone,
                     forced_direction=selected_direction,
                 )
-            elif selected is not None:
+            elif selected is not None and speech_should_run:
                 groq_navigation.request(
                     final_bucket,
                     cls_name if cls_name != "none" else "obstacle",
@@ -4757,16 +4987,20 @@ def main():
                     closing_speed,
                     current_ttc,
                 )
-            else:
-                # No selected obstacle: end the current Groq event episode.
+            elif selected is not None:
+                # LOW stationary: explicitly reset the LLM episode so any prior
+                # pending low-risk narration cannot leak into a silent scene.
                 groq_navigation.reset()
-                speech.request(
-                    final_bucket,
-                    selected,
-                    w,
-                    unknown_zone=unknown_zone,
-                    forced_direction=selected_direction,
-                )
+            else:
+                groq_navigation.reset()
+                if final_bucket in {"CRITICAL", "HIGH", "MEDIUM"}:
+                    speech.request(
+                        final_bucket,
+                        selected,
+                        w,
+                        unknown_zone=unknown_zone,
+                        forced_direction=selected_direction,
+                    )
 
             selected_source = (
                 "VISION OVERRIDE"
@@ -5182,6 +5416,7 @@ def main():
     finally:
         midas_worker.stop()
         reader.release()
+        haptic.stop()
         ultrasonic.stop()
         groq_navigation.stop()
         speech.stop()
