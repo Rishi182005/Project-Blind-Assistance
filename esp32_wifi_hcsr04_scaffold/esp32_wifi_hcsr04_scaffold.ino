@@ -69,6 +69,7 @@ String serialBuffer;
 String currentMode = "OFF";
 String currentDirection = "FRONT";
 unsigned long lastPatternMs = 0;
+unsigned long patternStartMs = 0;
 
 // ---------------- PCA helpers ----------------
 void writeRegister(uint8_t reg, uint8_t value) {
@@ -117,36 +118,66 @@ int directionChannel(const String &direction) {
 }
 
 void applyPattern() {
-  unsigned long now = millis();
+  unsigned long elapsed = millis() - patternStartMs;
 
   if (currentMode == "OFF") {
     allMotorsOff();
     return;
   }
 
+  // Risk-dependent haptic design:
+  // LOW      = one short pulse, long gap
+  // MEDIUM   = two short pulses, then a gap
+  // HIGH     = three rapid pulses, then a gap
+  // CRITICAL = rapid repeated pulses, strongest level
+  //
+  // The pulse pattern carries urgency, so LOW/MEDIUM are not continuous.
   uint16_t duty = 0;
-  unsigned long onOffPeriod = 1000;
+  unsigned long cycleMs = 1000;
+  bool outputOn = false;
 
   if (currentMode == "LOW") {
+    // 30% PWM, 120 ms ON every 1500 ms.
     duty = PWM_LOW;
-    onOffPeriod = 900;
-  } else if (currentMode == "MEDIUM") {
+    cycleMs = 1500;
+    unsigned long phase = elapsed % cycleMs;
+    outputOn = (phase < 120);
+  }
+  else if (currentMode == "MEDIUM") {
+    // 50% PWM: 2 x 150 ms pulses with 250 ms between them,
+    // followed by a long pause.
     duty = PWM_MEDIUM;
-    onOffPeriod = 500;
-  } else if (currentMode == "HIGH") {
+    cycleMs = 1750;
+    unsigned long phase = elapsed % cycleMs;
+    outputOn = (phase < 150) || (phase >= 400 && phase < 550);
+  }
+  else if (currentMode == "HIGH") {
+    // 75% PWM: 3 rapid pulses, then a pause.
     duty = PWM_HIGH;
-    onOffPeriod = 250;
-  } else if (currentMode == "CRITICAL") {
+    cycleMs = 1260;
+    unsigned long phase = elapsed % cycleMs;
+    outputOn = (phase < 180)
+            || (phase >= 360 && phase < 540)
+            || (phase >= 720 && phase < 900);
+  }
+  else if (currentMode == "CRITICAL") {
+    // 100% PWM: 4 rapid, unmistakable pulses, then a short pause.
     duty = PWM_CRITICAL;
-    onOffPeriod = 120;
-  } else {
+    cycleMs = 850;
+    unsigned long phase = elapsed % cycleMs;
+    outputOn = (phase < 150)
+            || (phase >= 250 && phase < 400)
+            || (phase >= 500 && phase < 650)
+            || (phase >= 750 && phase < 850);
+  }
+  else {
     allMotorsOff();
     return;
   }
 
-  bool outputOn = ((now / onOffPeriod) % 2 == 0);
   int activeChannel = directionChannel(currentDirection);
 
+  // Only the selected directional motor is driven.
   for (uint8_t ch = 0; ch < 4; ch++) {
     if (ch == activeChannel && outputOn) {
       if (currentMode == "CRITICAL") {
@@ -179,8 +210,13 @@ void setHapticCommand(String mode, String direction) {
     mode = "OFF";
   }
 
+  bool changed = (currentMode != mode) || (currentDirection != direction);
   currentMode = mode;
   currentDirection = direction;
+  if (changed) {
+    patternStartMs = millis();
+    allMotorsOff();
+  }
 
   Serial.print("HAPTIC ACK: ");
   Serial.print(currentMode);
