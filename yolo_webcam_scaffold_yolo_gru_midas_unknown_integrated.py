@@ -1,28 +1,4 @@
 import math
-"""
-YOLOv8n webcam/video scaffold for the wearable nav system -- MULTI-OBJECT
-TRACKING VERSION.
-
-Difference from the single-nearest-object scaffold: instead of collapsing
-to "whichever object is closest right now" every single frame, this keeps
-a small set of tracked objects across frames (matched by centroid distance
-+ class), computes closing speed PER OBJECT, estimates time-to-collision
-(TTC) per object, and selects whichever tracked object currently has the
-LOWEST TTC as "the" obstacle fed to the GRU.
-
-Why this matters: a fast object far away (e.g. a car approaching quickly)
-can be more urgent than a slow/stationary object that's physically closer
-(e.g. a pole 2m away). Picking by raw nearest-distance misses this --
-picking by TTC catches it.
-
-Still 100% software -- no new hardware required. YOLO distance uses the
-existing calibrated bbox-size heuristic. MiDaS-only distance uses raw MiDaS
-inverse-depth with a separate online metric calibration learned from matched
-YOLO+MiDaS objects.
-
-pip install ultralytics opencv-python --break-system-packages
-"""
-
 import time
 import threading
 from collections import deque
@@ -42,13 +18,6 @@ if os.name == "nt":
 import sys
 import re
 import multiprocessing as mp
-
-try:
-    import serial
-    from serial.tools import list_ports
-except Exception:
-    serial = None
-    list_ports = None
 
 try:
     from groq import Groq
@@ -100,12 +69,12 @@ FAR_OBJECT_MAX_TTC_S = 6.0
 
 
 # ---- ESP32 haptic feedback layer ----
-# Python sends only high-level commands; the ESP32 generates local pulse patterns.
+# Python sends high-level haptic commands to the ESP32 over Wi-Fi UDP.
+# The ESP32 can therefore remain powered from the wearable power bank.
 HAPTIC_ENABLED = True
-HAPTIC_SERIAL_PORT = "COM13"
-HAPTIC_BAUD = 115200
-HAPTIC_SERIAL_TIMEOUT_S = 0.05
-HAPTIC_RECONNECT_S = 2.0
+HAPTIC_UDP_PORT = 4211
+HAPTIC_SEND_TIMEOUT_S = 0.05
+HAPTIC_RETRY_INTERVAL_S = 0.50
 HAPTIC_DIRECTION_MAP = {
     "front": "FRONT",
     "ahead": "FRONT",
@@ -119,102 +88,59 @@ HAPTIC_DIRECTION_MAP = {
 }
 
 class HapticManager:
-    """Non-blocking serial bridge from Python navigation state to the ESP32 haptic controller."""
+    """Non-blocking UDP bridge from Python navigation state to the ESP32."""
 
-    def __init__(self):
-        self.enabled = bool(HAPTIC_ENABLED and serial is not None)
-        self.ser = None
+    def __init__(self, ultrasonic_receiver=None):
+        self.enabled = bool(HAPTIC_ENABLED)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(HAPTIC_SEND_TIMEOUT_S)
         self.last_command = None
         self.last_attempt = 0.0
+        self.last_endpoint = None
+        self.ultrasonic_receiver = ultrasonic_receiver
         self.lock = threading.Lock()
-        if HAPTIC_ENABLED and serial is None:
-            print("Haptics: pyserial not installed | run: python -m pip install pyserial")
-        elif HAPTIC_ENABLED:
-            print(f"Haptics: enabled | serial={HAPTIC_SERIAL_PORT} | baud={HAPTIC_BAUD}")
+        if self.enabled:
+            print(f"Haptics: enabled | UDP port={HAPTIC_UDP_PORT}")
         else:
             print("Haptics: disabled")
 
-    @staticmethod
-    def _port_candidates():
-        if list_ports is None:
-            return []
-        candidates = []
-        for p in list_ports.comports():
-            text = " ".join(
-                str(x or "") for x in (p.device, p.description, p.manufacturer, p.product)
-            ).lower()
-            vid = getattr(p, "vid", None)
-            # Common ESP32 USB-UART/native-USB identifiers. This is only a preference;
-            # AUTO will fall back to any available serial port if there is exactly one.
-            preferred_vids = {0x10C4, 0x1A86, 0x0403, 0x303A}
-            score = 0
-            if vid in preferred_vids:
-                score += 10
-            if "espressif" in text or "esp32" in text or "cp210" in text or "ch340" in text:
-                score += 5
-            candidates.append((score, p.device))
-        candidates.sort(reverse=True)
-        return [device for _score, device in candidates]
-
-    def _ensure_connected(self):
-        if not self.enabled:
-            return False
-        now = time.monotonic()
-        if self.ser is not None and getattr(self.ser, "is_open", False):
-            return True
-        if now - self.last_attempt < HAPTIC_RECONNECT_S:
-            return False
-        self.last_attempt = now
-
-        if str(HAPTIC_SERIAL_PORT).upper() == "AUTO":
-            ports = self._port_candidates()
-            if not ports:
-                return False
-            if len(ports) > 1 and ports[0] is not None:
-                # Prefer the best-scored candidate. If all scores are tied and
-                # several ports exist, print them so the user can set the port explicitly.
-                best_score = 0
-                if list_ports is not None:
-                    for p in list_ports.comports():
-                        if p.device == ports[0]:
-                            vid = getattr(p, "vid", None)
-                            desc = str(getattr(p, "description", ""))
-                            txt = f"{p.device} {desc}".lower()
-                            best_score = (10 if vid in {0x10C4,0x1A86,0x0403,0x303A} else 0) + (5 if any(k in txt for k in ("esp32","espressif","cp210","ch340")) else 0)
-                            break
-                if best_score == 0 and len(ports) > 1:
-                    print(f"Haptics: multiple serial ports found {ports}; set HAPTIC_SERIAL_PORT explicitly")
-                    return False
-            port = ports[0]
-        else:
-            port = str(HAPTIC_SERIAL_PORT)
-
+    def _esp32_ip(self):
+        if self.ultrasonic_receiver is None:
+            return None
         try:
-            self.ser = serial.Serial(
-                port=port,
-                baudrate=HAPTIC_BAUD,
-                timeout=HAPTIC_SERIAL_TIMEOUT_S,
-                write_timeout=HAPTIC_SERIAL_TIMEOUT_S,
-            )
-            time.sleep(0.20)
-            print(f"Haptics: connected -> {port}")
-            return True
-        except Exception as exc:
-            self.ser = None
-            print(f"Haptics: serial connection failed on {port}: {type(exc).__name__}: {exc}")
-            return False
+            return self.ultrasonic_receiver.get_sender_ip()
+        except Exception:
+            return None
 
     @staticmethod
     def _direction(direction):
         key = str(direction or "front").strip().lower()
         return HAPTIC_DIRECTION_MAP.get(key, "FRONT")
 
+    def _send(self, command):
+        now = time.monotonic()
+        if now - self.last_attempt < HAPTIC_RETRY_INTERVAL_S and self.last_endpoint is None:
+            return False
+        self.last_attempt = now
+
+        ip = self._esp32_ip()
+        if not ip:
+            return False
+
+        endpoint = (ip, HAPTIC_UDP_PORT)
+        try:
+            self.sock.sendto((command + "\n").encode("ascii", errors="ignore"), endpoint)
+            self.last_endpoint = endpoint
+            return True
+        except OSError as exc:
+            print(f"Haptics: UDP send failed to {endpoint}: {type(exc).__name__}: {exc}")
+            return False
+
     def update(self, bucket, direction, motion_state):
         """Apply the user's interaction design.
 
         CRITICAL -> haptic always.
-        HIGH/MEDIUM -> haptic only while not moving.
-        LOW -> haptic only while not moving.
+        HIGH/MEDIUM/LOW -> haptic while not moving.
         Moving object -> no haptic; speech layer handles the moving-object narration.
         """
         if not self.enabled:
@@ -238,37 +164,23 @@ class HapticManager:
         command = f"HAPTIC,{mode},{mapped_direction}"
 
         with self.lock:
-            if command == self.last_command:
+            if command == self.last_command and self.last_endpoint is not None:
                 return
-            self.last_command = command
 
-        if not self._ensure_connected():
-            return
-        try:
-            self.ser.write((command + "\n").encode("ascii", errors="ignore"))
-        except Exception as exc:
-            print(f"Haptics: write failed: {type(exc).__name__}: {exc}")
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-            self.ser = None
+        if self._send(command):
+            with self.lock:
+                self.last_command = command
 
     def stop(self):
         if not self.enabled:
             return
         try:
-            if self._ensure_connected():
-                self.ser.write(b"HAPTIC,OFF,FRONT\n")
-        except Exception:
-            pass
-        try:
-            if self.ser is not None:
-                self.ser.close()
-        except Exception:
-            pass
-        self.ser = None
-
+            self._send("HAPTIC,OFF,FRONT")
+        finally:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
 
 
 
@@ -1844,6 +1756,7 @@ class UltrasonicReceiver:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, self.port))
         self.sock.settimeout(0.2)
+        self.sender_ip = None
 
         self.thread = threading.Thread(
             target=self._receive_loop,
@@ -1854,6 +1767,10 @@ class UltrasonicReceiver:
 
         print(f"Ultrasonic UDP receiver listening on port {self.port}")
         print("Ultrasonic channels: FRONT + REAR")
+
+    def get_sender_ip(self):
+        with self.lock:
+            return self.sender_ip
 
     def _update_channel(self, channel, distance_cm, now):
         state = self.channels[channel]
@@ -1917,7 +1834,7 @@ class UltrasonicReceiver:
     def _receive_loop(self):
         while self.running:
             try:
-                data, _ = self.sock.recvfrom(1024)
+                data, addr = self.sock.recvfrom(1024)
             except socket.timeout:
                 continue
             except OSError:
@@ -1925,6 +1842,8 @@ class UltrasonicReceiver:
 
             try:
                 text = data.decode("utf-8").strip()
+                with self.lock:
+                    self.sender_ip = addr[0]
                 parts = {}
                 for item in text.split(","):
                     if ":" in item:
@@ -4093,7 +4012,7 @@ def main():
     reader = LatestFrameReader(SOURCE)
     ultrasonic = UltrasonicReceiver(host="0.0.0.0", port=4210)
     speech = SpeechManager()
-    haptic = HapticManager()
+    haptic = HapticManager(ultrasonic_receiver=ultrasonic)
     display_throttler = DisplayThrottler()
     groq_navigation = GroqNavigationManager(speech)
 

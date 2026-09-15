@@ -22,7 +22,7 @@
 //   PWM2 / column 3 -> Motor 3 -> FRONT-RIGHT
 //   PWM3 / column 4 -> Motor 4 -> BACK
 //
-// Serial commands from Python:
+// Haptic UDP commands from Python (ESP32 listens on UDP port 4211):
 //   HAPTIC,LOW,FRONT
 //   HAPTIC,MEDIUM,FRONT_LEFT
 //   HAPTIC,HIGH,FRONT_RIGHT
@@ -40,6 +40,7 @@ const char* WIFI_PASSWORD = "Devi@1002";
 // Keep the same laptop IP used by your working ultrasonic sketch.
 const char* LAPTOP_IP = "192.168.29.85";
 const uint16_t LAPTOP_PORT = 4210;
+const uint16_t HAPTIC_UDP_PORT = 4211;
 
 WiFiUDP udp;
 
@@ -66,6 +67,7 @@ const uint16_t PWM_HIGH     = 3072;  // 75%
 const uint16_t PWM_CRITICAL = 4095;  // 100%
 
 String serialBuffer;
+String udpBuffer;
 String currentMode = "OFF";
 String currentDirection = "FRONT";
 unsigned long lastPatternMs = 0;
@@ -266,6 +268,25 @@ void handleSerial() {
   }
 }
 
+// ---------------- Haptic UDP input ----------------
+void handleHapticUdp() {
+  int packetSize = udp.parsePacket();
+  while (packetSize > 0) {
+    char packet[128];
+    int len = udp.read(packet, sizeof(packet) - 1);
+    if (len < 0) len = 0;
+    packet[len] = '\0';
+
+    String line = String(packet);
+    line.trim();
+    if (line.length() > 0) {
+      parseSerialCommand(line);
+    }
+
+    packetSize = udp.parsePacket();
+  }
+}
+
 // ---------------- Ultrasonic helpers ----------------
 float readDistanceCm(int trigPin, int echoPin) {
   digitalWrite(trigPin, LOW);
@@ -362,10 +383,14 @@ void setup() {
   Serial.println("HAPTIC: PWM0=Front PWM1=FrontLeft PWM2=FrontRight PWM3=Back");
 
   connectWiFi();
+  udp.begin(HAPTIC_UDP_PORT);
+  Serial.print("HAPTIC UDP listening on port: ");
+  Serial.println(HAPTIC_UDP_PORT);
 }
 
 void loop() {
   handleSerial();
+  handleHapticUdp();
 
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
