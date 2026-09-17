@@ -288,6 +288,10 @@ void handleHapticUdp() {
 }
 
 // ---------------- Ultrasonic helpers ----------------
+const unsigned long ULTRASONIC_TIMEOUT_US = 25000UL;  // ~4.3 m maximum echo wait
+const unsigned long SENSOR_SEPARATION_MS = 60;         // reduce front/rear cross-talk
+const unsigned long REAR_RETRY_DELAY_MS = 6;           // quick recovery after a missed rear echo
+
 float readDistanceCm(int trigPin, int echoPin) {
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
@@ -296,13 +300,34 @@ float readDistanceCm(int trigPin, int echoPin) {
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  unsigned long duration = pulseIn(echoPin, HIGH, 30000UL);
+  // Keep the timeout bounded so a missed echo cannot stall the whole loop.
+  unsigned long duration = pulseIn(echoPin, HIGH, ULTRASONIC_TIMEOUT_US);
 
   if (duration == 0) {
     return -1.0f;
   }
 
-  return (float)duration * 0.0343f / 2.0f;
+  float distanceCm = (float)duration * 0.0343f / 2.0f;
+
+  // Reject physically invalid/clearly noisy HC-SR04 results.
+  if (distanceCm < 2.0f || distanceCm > 430.0f) {
+    return -1.0f;
+  }
+
+  return distanceCm;
+}
+
+float readRearDistanceReliable() {
+  float rearCm = readDistanceCm(REAR_TRIG_PIN, REAR_ECHO_PIN);
+
+  // A single missed rear echo is common with HC-SR04s. Retry once quickly
+  // instead of allowing one missed echo to look like several seconds of loss.
+  if (rearCm < 0.0f) {
+    delay(REAR_RETRY_DELAY_MS);
+    rearCm = readDistanceCm(REAR_TRIG_PIN, REAR_ECHO_PIN);
+  }
+
+  return rearCm;
 }
 
 void connectWiFi() {
@@ -334,8 +359,8 @@ void sendUltrasonicPacket() {
 
   // Trigger separately to reduce cross-talk.
   float frontCm = readDistanceCm(FRONT_TRIG_PIN, FRONT_ECHO_PIN);
-  delay(60);
-  float rearCm = readDistanceCm(REAR_TRIG_PIN, REAR_ECHO_PIN);
+  delay(SENSOR_SEPARATION_MS);
+  float rearCm = readRearDistanceReliable();
 
   char packet[128];
   snprintf(packet, sizeof(packet),
@@ -396,8 +421,9 @@ void loop() {
     connectWiFi();
   }
 
-  // Local haptic pattern, non-blocking apart from the two ultrasonic
-  // measurements that were already used by the working firmware.
+  // Local haptic pattern. Ultrasonic reads are bounded and the rear sensor
+  // gets one quick retry after a missed echo, so a temporary rear timeout
+  // does not turn into a prolonged apparent sensor outage.
   if (millis() - lastPatternMs >= 20) {
     lastPatternMs = millis();
     applyPattern();

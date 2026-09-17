@@ -18,6 +18,7 @@ if os.name == "nt":
 import sys
 import re
 import multiprocessing as mp
+import difflib
 
 try:
     from groq import Groq
@@ -53,7 +54,7 @@ SPEECH_RIGHT_ZONE_FRAC = 0.66
 GROQ_ENABLED = True
 GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_TIMEOUT_S = 1.2
-GROQ_MAX_TOKENS = 50
+GROQ_MAX_TOKENS = 80
 GROQ_DISTANCE_EVENT_M = 0.60
 GROQ_MIN_EVENT_INTERVAL_S = 2.00
 
@@ -1318,6 +1319,9 @@ class GroqNavigationManager:
         self.last_context = None
         self.last_event_time = 0.0
         self.last_spoken_message = None
+        # Previous Groq wording is used only to force grammatical variation.
+        # Safety state, risk decisions, and deterministic emergency speech are unchanged.
+        self.last_groq_message = None
         self.context_generation = 0
         self.bucket_change_candidate = None
         self.bucket_change_start = None
@@ -1511,13 +1515,16 @@ IMPORTANT SAFETY:
 
 STYLE:
 - Do NOT start every HIGH warning with "Stop".
-- HIGH should sound varied and natural: "Caution...", "Obstacle close...", "Watch your path...", "Keep clear...", "Slow down..."
-- HIGH may use a conditional countermeasure when it helps: e.g. "Obstacle front-left at 50 centimetres; move slightly right if clear."
+- HIGH should sound varied and natural.
+- HIGH may use a conditional countermeasure when it helps: e.g. "There is a person front-left at 50 centimetres; move slightly right if clear."
 - CRITICAL in the FRONT normally requires an urgent stop instruction when the obstacle is approaching.
 - CRITICAL at the BACK must NEVER tell the user to stop. Say that the hazard is behind them and use a conditional forward instruction such as "move forward if the path is clear."
 - A front obstacle that is moving away must NOT trigger an immediate stop instruction merely because it is close. Use "moving away" and continue cautiously unless the supplied state explicitly requires otherwise.
 - MEDIUM should normally begin with "Caution" or "Watch your path".
-- Avoid repeating the same sentence structure for consecutive events.
+- Avoid the declarative template "[object] [direction] at [distance]." and avoid repeating the same grammatical structure as the previous warning.
+- Vary the sentence construction, not the safety facts. You may use an attention cue, an imperative, an existential construction, a relational phrase, or a conditional instruction when appropriate.
+- Examples of different structures: "Watch the person on your right, about 80 centimetres away."; "There is a chair ahead at 1.4 metres."; "Keep clear of the backpack front-left, now 70 centimetres away."; "A person is approaching from your right at 1.1 metres; shift left if clear."
+- Do not copy any example literally. Produce a fresh sentence for the supplied scene.
 - Mention the object when known. Say "unknown object" when that is the object label.
 - Include distance and direction whenever available.
 - If the object is moving away, say "moving away" and do not call it approaching.
@@ -1531,60 +1538,125 @@ Direction: {ctx['direction']}
 Closing speed: {ctx['closing_speed']:+.2f} m/s
 Movement: {ctx['approach_state']}
 TTC: {ttc_text}
+
+PREVIOUS GROQ WARNING:
+{self.last_groq_message or "(none)"}
+Do not reuse its wording or sentence structure.
 """
 
     @staticmethod
     def _is_fragment_response(text):
-        """Reject truncated/continuation-like LLM output before it reaches TTS."""
+        """Reject truncated/continuation-like or obviously incomplete Groq output."""
         text = str(text or "").strip()
         if not text:
             return True
+
         # A continuation beginning with punctuation is not a complete spoken warning.
         if re.match(r"^[,.;:!?\-–—]", text):
             return True
-        # Likewise, a movement-only continuation is exactly the failure mode seen
-        # when a second event is generated from bbox jitter.
+
+        # Movement-only continuations are not useful warnings.
         if re.match(r"^(?:the\s+)?(?:obstacle\s+)?(?:is\s+)?moving\s+away\b", text, re.IGNORECASE):
             return True
         if re.match(r"^(?:the\s+)?(?:obstacle\s+)?(?:is\s+)?approaching\b", text, re.IGNORECASE):
             return True
+
+        normalized = re.sub(r"\s+", " ", text).strip()
+        words = normalized.split()
+
+        # Very short outputs such as "Caution: person" or "Watch your path—person"
+        # are commonly truncated generations, not complete navigation instructions.
+        if len(words) < 5:
+            return True
+
+        # Groq occasionally stops immediately after a grammatical lead-in.
+        trailing_incomplete = {
+            "a", "an", "the", "at", "from", "to", "on", "in", "with",
+            "and", "or", "but", "because", "as", "is", "are", "be",
+            "ahead", "behind", "left", "right", "front", "back",
+            "caution", "watch", "keep", "avoid", "move",
+        }
+        final_word = re.sub(r"[^a-z0-9]+$", "", words[-1].lower())
+        if final_word in trailing_incomplete and not re.search(r"[.!?]$", normalized):
+            return True
+
         return False
 
+    @staticmethod
+    def _finalize_groq_text(text):
+        """Normalize harmless formatting while preserving Groq's sentence construction."""
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if text and not re.search(r"[.!?]$", text):
+            text += "."
+        return text
+
+    @staticmethod
+    def _normalize_for_similarity(text):
+        text = re.sub(r"[^a-z0-9\s]", " ", str(text).lower())
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _groq_wording_is_too_similar(self, text):
+        previous = self.last_groq_message
+        if not previous:
+            return False
+        a = self._normalize_for_similarity(text)
+        b = self._normalize_for_similarity(previous)
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        # Compare word sets only as a light wording guard. Safety values are not
+        # changed; this merely detects an effectively copied sentence.
+        ratio = difflib.SequenceMatcher(None, a, b).ratio()
+        return ratio >= 0.82
+
     def _call_groq(self, ctx):
+        prompt = self._prompt(ctx)
+
         response = self.client.chat.completions.create(
             model=GROQ_MODEL,
-            messages=[{"role": "user", "content": self._prompt(ctx)}],
-            temperature=0,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.70,
             max_tokens=GROQ_MAX_TOKENS,
             reasoning_effort="low",
         )
         text = response.choices[0].message.content.strip()
-        if self._is_fragment_response(text):
-            raise RuntimeError("fragmented Groq response")
 
-        # HIGH risk does not need the same "Stop" opening on every event.
-        # Convert repetitive openings into varied caution language while
-        # preserving CRITICAL urgency.
-        if str(ctx["bucket"]).upper() == "HIGH":
-            text = re.sub(
-                r"^\s*stop[.!,:;\-]*\s*",
-                "",
-                text,
-                flags=re.IGNORECASE,
+        # A complete Groq sentence is required. If the first generation is truncated
+        # or too similar to the previous warning, give Groq one controlled rewrite.
+        needs_rewrite = self._is_fragment_response(text) or self._groq_wording_is_too_similar(text)
+        if needs_rewrite:
+            reason = (
+                "The draft is incomplete."
+                if self._is_fragment_response(text)
+                else "The draft is too similar to the previous warning."
             )
-            openings = [
-                "Caution. ",
-                "Obstacle close. ",
-                "Watch your path. ",
-                "Keep clear. ",
-                "Slow down. ",
-            ]
-            selector = hash(
-                f"{ctx['object']}|{ctx['direction']}|{round(ctx['distance'], 1)}|{ctx['approach_state']}"
-            ) % len(openings)
-            opening = openings[selector]
-            if not text.lower().startswith(tuple(o.lower().strip() for o in openings)):
-                text = opening + text[:1].lower() + text[1:] if text else opening.strip()
+            rewrite_prompt = (
+                prompt
+                + "\n\nREWRITE REQUIRED:\n"
+                  + reason + "\n"
+                  "Return exactly ONE complete natural spoken instruction, 6 to 22 words.\n"
+                  "Use a clearly different sentence structure and opening from the previous warning.\n"
+                  "Do not stop mid-sentence. End with a complete thought.\n"
+                  "Do not use the template '[object] [direction] at [distance]'.\n"
+                  "Preserve every supplied safety fact exactly: object, distance, direction, movement, risk, and TTC.\n"
+                  "Do not add new objects, distances, routes, or safety claims.\n"
+            )
+            response = self.client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": rewrite_prompt}],
+                temperature=0.85,
+                max_tokens=GROQ_MAX_TOKENS,
+                reasoning_effort="low",
+            )
+            rewritten = response.choices[0].message.content.strip()
+            if not self._is_fragment_response(rewritten):
+                text = rewritten
+            else:
+                raise RuntimeError("incomplete Groq response")
+
+        text = self._finalize_groq_text(text)
+
         # Remove unnatural/militaristic wording even if the LLM ignores the prompt.
         text = re.sub(r"\btake\s+position\b", "move carefully", text, flags=re.IGNORECASE)
         text = re.sub(r"\bhold\s+position\b", "stay where you are", text, flags=re.IGNORECASE)
@@ -1643,6 +1715,8 @@ TTC: {ttc_text}
                 flags=re.IGNORECASE,
             )
             text = re.sub(r"\s{2,}", " ", text).strip()
+
+        self.last_groq_message = text
         return text
 
     def _worker(self):
