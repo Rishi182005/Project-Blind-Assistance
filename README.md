@@ -492,16 +492,6 @@ The project report contains the complete reviewed reference list and APA-formatt
 
 ---
 
-## Author
-
-**Rishikesh M Ramasubramaniyan**  
-Registration No. **22MIA1163**  
-VIT Chennai
-
-**Guide:** Dr. Bhavadharini R M
-
----
-
 ## Disclaimer
 
 This repository documents an academic research prototype. It has been developed for experimentation, evaluation, and demonstration. Real-world deployment for safety-critical mobility requires substantially broader validation, hardware engineering, user testing, and regulatory/safety assessment.
