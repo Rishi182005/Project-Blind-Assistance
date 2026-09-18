@@ -59,12 +59,21 @@ const int REAR_ECHO_PIN  = 23;
 #define PRESCALE   0xFE
 #define LED0_ON_L  0x06
 
-// Bench-test starting levels. These can be changed later after
-// you tune the pulse patterns on the actual headband.
-const uint16_t PWM_LOW      = 1229;  // 30%
-const uint16_t PWM_MEDIUM   = 2048;  // 50%
-const uint16_t PWM_HIGH     = 3072;  // 75%
-const uint16_t PWM_CRITICAL = 4095;  // 100%
+// Direction-aware haptic intensity tuned for the cardboard wearable.
+// Front/Back motors are physically stronger, so their scale starts at 60%.
+// Left/Right motors are physically weaker, so their scale starts at 75%.
+// The four risk levels are linearly spread from the directional starting
+// level up to 100% at CRITICAL.
+//
+// FRONT/BACK: LOW 60%, MEDIUM 73%, HIGH 87%, CRITICAL 100%
+// LEFT/RIGHT: LOW 75%, MEDIUM 83%, HIGH 92%, CRITICAL 100%
+const uint16_t PWM_FB_LOW      = 2458;  // 60%
+const uint16_t PWM_FB_MEDIUM   = 3004;  // 73.3%
+const uint16_t PWM_FB_HIGH     = 3549;  // 86.7%
+const uint16_t PWM_LR_LOW      = 3072;  // 75%
+const uint16_t PWM_LR_MEDIUM   = 3413;  // 83.3%
+const uint16_t PWM_LR_HIGH     = 3755;  // 91.7%
+const uint16_t PWM_CRITICAL    = 4095;  // 100%
 
 String serialBuffer;
 String udpBuffer;
@@ -72,6 +81,25 @@ String currentMode = "OFF";
 String currentDirection = "FRONT";
 unsigned long lastPatternMs = 0;
 unsigned long patternStartMs = 0;
+
+// ------------------------------------------------------------
+// HAPTIC DIRECTION RHYTHM
+// ------------------------------------------------------------
+// Direction is encoded by rhythm rather than relying only on
+// where the motor physically sits. Every event has a fixed slot
+// with a long silent tail, so repeated detections cannot blend
+// into one long sequence and look like another direction.
+//
+// FRONT       = 1 short pulse
+// FRONT_LEFT  = 2 close pulses
+// FRONT_RIGHT = 2 pulses with a longer gap
+// BACK        = 3 close pulses
+//
+// Risk level controls intensity; direction controls rhythm.
+const unsigned long HAPTIC_EVENT_CYCLE_MS = 1500;
+const unsigned long HAPTIC_PULSE_ON_MS = 110;
+const unsigned long HAPTIC_GAP_CLOSE_MS = 120;
+const unsigned long HAPTIC_GAP_RIGHT_MS = 280;
 
 // ---------------- PCA helpers ----------------
 void writeRegister(uint8_t reg, uint8_t value) {
@@ -119,67 +147,84 @@ int directionChannel(const String &direction) {
   return 0;
 }
 
-void applyPattern() {
-  unsigned long elapsed = millis() - patternStartMs;
+uint16_t modeDuty() {
+  if (currentMode == "CRITICAL") return PWM_CRITICAL;
 
+  const bool leftRight = (currentDirection == "FRONT_LEFT" ||
+                          currentDirection == "FRONT_RIGHT");
+
+  if (currentMode == "LOW") {
+    return leftRight ? PWM_LR_LOW : PWM_FB_LOW;
+  }
+  if (currentMode == "MEDIUM") {
+    return leftRight ? PWM_LR_MEDIUM : PWM_FB_MEDIUM;
+  }
+  if (currentMode == "HIGH") {
+    return leftRight ? PWM_LR_HIGH : PWM_FB_HIGH;
+  }
+  return 0;
+}
+
+bool directionPulseIsOn(unsigned long phase) {
+  // FRONT: one pulse at the start of the 1.5 s event slot.
+  if (currentDirection == "FRONT") {
+    return phase < HAPTIC_PULSE_ON_MS;
+  }
+
+  // FRONT_LEFT: two close pulses.
+  if (currentDirection == "FRONT_LEFT") {
+    const unsigned long p1Start = 0;
+    const unsigned long p1End = HAPTIC_PULSE_ON_MS;
+    const unsigned long p2Start = HAPTIC_PULSE_ON_MS + HAPTIC_GAP_CLOSE_MS;
+    const unsigned long p2End = p2Start + HAPTIC_PULSE_ON_MS;
+    return (phase >= p1Start && phase < p1End) ||
+           (phase >= p2Start && phase < p2End);
+  }
+
+  // FRONT_RIGHT: two pulses separated by a noticeably longer gap.
+  if (currentDirection == "FRONT_RIGHT") {
+    const unsigned long p1Start = 0;
+    const unsigned long p1End = HAPTIC_PULSE_ON_MS;
+    const unsigned long p2Start = HAPTIC_PULSE_ON_MS + HAPTIC_GAP_RIGHT_MS;
+    const unsigned long p2End = p2Start + HAPTIC_PULSE_ON_MS;
+    return (phase >= p1Start && phase < p1End) ||
+           (phase >= p2Start && phase < p2End);
+  }
+
+  // BACK: three close pulses.
+  if (currentDirection == "BACK") {
+    const unsigned long step = HAPTIC_PULSE_ON_MS + HAPTIC_GAP_CLOSE_MS;
+    const unsigned long p1Start = 0;
+    const unsigned long p2Start = step;
+    const unsigned long p3Start = 2 * step;
+    return (phase >= p1Start && phase < p1Start + HAPTIC_PULSE_ON_MS) ||
+           (phase >= p2Start && phase < p2Start + HAPTIC_PULSE_ON_MS) ||
+           (phase >= p3Start && phase < p3Start + HAPTIC_PULSE_ON_MS);
+  }
+
+  return false;
+}
+
+void applyPattern() {
   if (currentMode == "OFF") {
     allMotorsOff();
     return;
   }
 
-  // Risk-dependent haptic design:
-  // LOW      = one short pulse, long gap
-  // MEDIUM   = two short pulses, then a gap
-  // HIGH     = three rapid pulses, then a gap
-  // CRITICAL = rapid repeated pulses, strongest level
-  //
-  // The pulse pattern carries urgency, so LOW/MEDIUM are not continuous.
-  uint16_t duty = 0;
-  unsigned long cycleMs = 1000;
-  bool outputOn = false;
-
-  if (currentMode == "LOW") {
-    // 30% PWM, 120 ms ON every 1500 ms.
-    duty = PWM_LOW;
-    cycleMs = 1500;
-    unsigned long phase = elapsed % cycleMs;
-    outputOn = (phase < 120);
-  }
-  else if (currentMode == "MEDIUM") {
-    // 50% PWM: 2 x 150 ms pulses with 250 ms between them,
-    // followed by a long pause.
-    duty = PWM_MEDIUM;
-    cycleMs = 1750;
-    unsigned long phase = elapsed % cycleMs;
-    outputOn = (phase < 150) || (phase >= 400 && phase < 550);
-  }
-  else if (currentMode == "HIGH") {
-    // 75% PWM: 3 rapid pulses, then a pause.
-    duty = PWM_HIGH;
-    cycleMs = 1260;
-    unsigned long phase = elapsed % cycleMs;
-    outputOn = (phase < 180)
-            || (phase >= 360 && phase < 540)
-            || (phase >= 720 && phase < 900);
-  }
-  else if (currentMode == "CRITICAL") {
-    // 100% PWM: 4 rapid, unmistakable pulses, then a short pause.
-    duty = PWM_CRITICAL;
-    cycleMs = 850;
-    unsigned long phase = elapsed % cycleMs;
-    outputOn = (phase < 150)
-            || (phase >= 250 && phase < 400)
-            || (phase >= 500 && phase < 650)
-            || (phase >= 750 && phase < 850);
-  }
-  else {
+  const uint16_t duty = modeDuty();
+  if (duty == 0) {
     allMotorsOff();
     return;
   }
 
-  int activeChannel = directionChannel(currentDirection);
+  // Fixed event slot. If Python repeats the same command, we do
+  // not queue another pulse train; the current pattern continues
+  // and naturally repeats after its silent tail.
+  const unsigned long elapsed = millis() - patternStartMs;
+  const unsigned long phase = elapsed % HAPTIC_EVENT_CYCLE_MS;
+  const bool outputOn = directionPulseIsOn(phase);
+  const int activeChannel = directionChannel(currentDirection);
 
-  // Only the selected directional motor is driven.
   for (uint8_t ch = 0; ch < 4; ch++) {
     if (ch == activeChannel && outputOn) {
       if (currentMode == "CRITICAL") {

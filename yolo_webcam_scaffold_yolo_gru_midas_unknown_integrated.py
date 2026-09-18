@@ -138,11 +138,12 @@ class HapticManager:
             return False
 
     def update(self, bucket, direction, motion_state):
-        """Apply the user's interaction design.
+        """Apply the wearable haptic interaction design.
 
         CRITICAL -> haptic always.
-        HIGH/MEDIUM/LOW -> haptic while not moving.
-        Moving object -> no haptic; speech layer handles the moving-object narration.
+        HIGH -> haptic whether stationary or moving.
+        MEDIUM/LOW -> haptic when the object is not moving.
+        Moving objects below HIGH remain speech-only.
         """
         if not self.enabled:
             return
@@ -151,11 +152,13 @@ class HapticManager:
         motion = str(motion_state or "stationary").lower()
         moving = motion != "stationary"
 
-        if bucket == "CRITICAL":
+        # A moving object at HIGH or CRITICAL still gets directional
+        # vibration. This keeps fast/dangerous moving hazards tactile.
+        if bucket in {"HIGH", "CRITICAL"}:
             active = True
         elif moving:
             active = False
-        elif bucket in {"HIGH", "MEDIUM", "LOW"}:
+        elif bucket in {"MEDIUM", "LOW"}:
             active = True
         else:
             active = False
@@ -4189,6 +4192,11 @@ def main():
                 or frame.shape[1] <= 0
             ):
                 continue
+
+            # The phone IP-camera stream is horizontally mirrored in the wearable setup.
+            # Flip the input before any YOLO/MiDaS processing so geometric left/right
+            # matches the wearer\'s real-world perspective.
+            frame = cv2.flip(frame, 1)
 
             if ROTATE:
                 frame = cv2.rotate(
