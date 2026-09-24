@@ -1909,6 +1909,9 @@ class UltrasonicReceiver:
         state["history"].append((now, filtered_cm))
 
     def _receive_loop(self):
+        # The ESP32 sends FRONT and REAR in the SAME UDP datagram.
+        # Both channels are therefore committed under one lock acquisition,
+        # so the vision loop never observes a half-updated ultrasonic pair.
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(1024)
@@ -1919,8 +1922,6 @@ class UltrasonicReceiver:
 
             try:
                 text = data.decode("utf-8").strip()
-                with self.lock:
-                    self.sender_ip = addr[0]
                 parts = {}
                 for item in text.split(","):
                     if ":" in item:
@@ -1929,22 +1930,31 @@ class UltrasonicReceiver:
 
                 now = time.monotonic()
 
-                # Preferred dual-sensor packet:
-                # front_cm:123.4,rear_cm:234.5,ts:123456
-                # Also accept front: / rear: aliases.
-                if "front_cm" in parts or "front" in parts:
-                    front_value = parts.get("front_cm", parts.get("front"))
+                front_value = parts.get("front_cm", parts.get("front"))
+                rear_value = parts.get("rear_cm", parts.get("rear"))
+
+                with self.lock:
+                    self.sender_ip = addr[0]
+
+                    # Commit both readings from this packet as one atomic update.
                     if front_value is not None:
-                        self._update_channel("front", float(front_value), now)
+                        try:
+                            self._update_channel("front", float(front_value), now)
+                        except (TypeError, ValueError):
+                            pass
 
-                if "rear_cm" in parts or "rear" in parts:
-                    rear_value = parts.get("rear_cm", parts.get("rear"))
                     if rear_value is not None:
-                        self._update_channel("rear", float(rear_value), now)
+                        try:
+                            self._update_channel("rear", float(rear_value), now)
+                        except (TypeError, ValueError):
+                            pass
 
-                # Backward compatibility with the original one-sensor firmware.
-                elif "distance_cm" in parts:
-                    self._update_channel("front", float(parts["distance_cm"]), now)
+                    # Backward compatibility with the original one-sensor firmware.
+                    if front_value is None and rear_value is None and "distance_cm" in parts:
+                        try:
+                            self._update_channel("front", float(parts["distance_cm"]), now)
+                        except (TypeError, ValueError):
+                            pass
 
             except (UnicodeDecodeError, ValueError, KeyError):
                 continue

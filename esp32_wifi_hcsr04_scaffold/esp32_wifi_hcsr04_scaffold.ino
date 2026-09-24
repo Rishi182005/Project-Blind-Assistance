@@ -34,11 +34,10 @@
 // ============================================================
 
 // ---------------- Wi-Fi / UDP ----------------
-const char* WIFI_SSID = "Rishi's Network";
-const char* WIFI_PASSWORD = "Devi@1002";
-
-// Keep the same laptop IP used by your working ultrasonic sketch.
-const char* LAPTOP_IP = "192.168.29.85";
+const char* WIFI_SSID = "Rishi's Network"; 
+const char* WIFI_PASSWORD = "Devi@1002"; 
+// Keep the same laptop IP used by your working ultrasonic sketch. const 
+char* LAPTOP_IP = "192.168.29.85";
 const uint16_t LAPTOP_PORT = 4210;
 const uint16_t HAPTIC_UDP_PORT = 4211;
 
@@ -333,28 +332,82 @@ void handleHapticUdp() {
 }
 
 // ---------------- Ultrasonic helpers ----------------
-const unsigned long ULTRASONIC_TIMEOUT_US = 25000UL;  // ~4.3 m maximum echo wait
-const unsigned long SENSOR_SEPARATION_MS = 60;         // reduce front/rear cross-talk
-const unsigned long REAR_RETRY_DELAY_MS = 6;           // quick recovery after a missed rear echo
+// FRONT and REAR are measured concurrently.
+// pulseIn() is deliberately NOT used because it blocks on one sensor before
+// the other sensor can be read.
+//
+// Both HC-SR04 trigger lines are driven together. Each ECHO line is
+// captured independently by an ISR.
+// Therefore an echo from FRONT never makes the code wait before capturing REAR.
 
-float readDistanceCm(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW);
+const unsigned long ULTRASONIC_TIMEOUT_US = 25000UL;  // ~4.3 m maximum
+volatile uint32_t frontEchoRiseUs = 0;
+volatile uint32_t rearEchoRiseUs = 0;
+volatile uint32_t frontEchoDurationUs = 0;
+volatile uint32_t rearEchoDurationUs = 0;
+volatile bool frontEchoDone = false;
+volatile bool rearEchoDone = false;
+
+void IRAM_ATTR frontEchoISR() {
+  uint32_t now = micros();
+
+  if (digitalRead(FRONT_ECHO_PIN)) {
+    frontEchoRiseUs = now;
+  } else if (frontEchoRiseUs != 0) {
+    frontEchoDurationUs = now - frontEchoRiseUs;
+    frontEchoRiseUs = 0;
+    frontEchoDone = true;
+  }
+}
+
+void IRAM_ATTR rearEchoISR() {
+  uint32_t now = micros();
+
+  if (digitalRead(REAR_ECHO_PIN)) {
+    rearEchoRiseUs = now;
+  } else if (rearEchoRiseUs != 0) {
+    rearEchoDurationUs = now - rearEchoRiseUs;
+    rearEchoRiseUs = 0;
+    rearEchoDone = true;
+  }
+}
+
+void triggerBothUltrasonicSensors() {
+  noInterrupts();
+
+  frontEchoRiseUs = 0;
+  rearEchoRiseUs = 0;
+  frontEchoDurationUs = 0;
+  rearEchoDurationUs = 0;
+  frontEchoDone = false;
+  rearEchoDone = false;
+
+  // Trigger both HC-SR04 sensors together.
+  // digitalWrite() is used for compatibility with the installed
+  // Arduino-ESP32 core; there is no 60 ms front/rear separation.
+  digitalWrite(FRONT_TRIG_PIN, LOW);
+  digitalWrite(REAR_TRIG_PIN, LOW);
+
   delayMicroseconds(2);
 
-  digitalWrite(trigPin, HIGH);
+  digitalWrite(FRONT_TRIG_PIN, HIGH);
+  digitalWrite(REAR_TRIG_PIN, HIGH);
+
   delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
 
-  // Keep the timeout bounded so a missed echo cannot stall the whole loop.
-  unsigned long duration = pulseIn(echoPin, HIGH, ULTRASONIC_TIMEOUT_US);
+  digitalWrite(FRONT_TRIG_PIN, LOW);
+  digitalWrite(REAR_TRIG_PIN, LOW);
 
-  if (duration == 0) {
+  interrupts();
+}
+
+float durationToDistanceCm(uint32_t durationUs) {
+  if (durationUs == 0 || durationUs > ULTRASONIC_TIMEOUT_US) {
     return -1.0f;
   }
 
-  float distanceCm = (float)duration * 0.0343f / 2.0f;
+  float distanceCm = (float)durationUs * 0.0343f / 2.0f;
 
-  // Reject physically invalid/clearly noisy HC-SR04 results.
   if (distanceCm < 2.0f || distanceCm > 430.0f) {
     return -1.0f;
   }
@@ -362,17 +415,35 @@ float readDistanceCm(int trigPin, int echoPin) {
   return distanceCm;
 }
 
-float readRearDistanceReliable() {
-  float rearCm = readDistanceCm(REAR_TRIG_PIN, REAR_ECHO_PIN);
+void readBothUltrasonicSimultaneously(float &frontCm, float &rearCm) {
+  triggerBothUltrasonicSensors();
 
-  // A single missed rear echo is common with HC-SR04s. Retry once quickly
-  // instead of allowing one missed echo to look like several seconds of loss.
-  if (rearCm < 0.0f) {
-    delay(REAR_RETRY_DELAY_MS);
-    rearCm = readDistanceCm(REAR_TRIG_PIN, REAR_ECHO_PIN);
+  // Wait for BOTH echo ISRs. There is no intentional front/rear delay.
+  uint32_t waitStart = micros();
+
+  while (true) {
+    bool frontDone;
+    bool rearDone;
+
+    noInterrupts();
+    frontDone = frontEchoDone;
+    rearDone = rearEchoDone;
+    uint32_t frontDuration = frontEchoDurationUs;
+    uint32_t rearDuration = rearEchoDurationUs;
+    interrupts();
+
+    uint32_t elapsed = micros() - waitStart;
+
+    if ((frontDone && rearDone) || elapsed >= ULTRASONIC_TIMEOUT_US) {
+      frontCm = durationToDistanceCm(frontDuration);
+      rearCm = durationToDistanceCm(rearDuration);
+      return;
+    }
+
+    // Yield to Wi-Fi/FreeRTOS while waiting for the echo edges.
+    // This does NOT introduce a sensor-to-sensor delay.
+    delayMicroseconds(20);
   }
-
-  return rearCm;
 }
 
 void connectWiFi() {
@@ -402,10 +473,11 @@ void sendUltrasonicPacket() {
   if (now - lastUltrasonicMs < ULTRASONIC_INTERVAL_MS) return;
   lastUltrasonicMs = now;
 
-  // Trigger separately to reduce cross-talk.
-  float frontCm = readDistanceCm(FRONT_TRIG_PIN, FRONT_ECHO_PIN);
-  delay(SENSOR_SEPARATION_MS);
-  float rearCm = readRearDistanceReliable();
+  // FRONT + REAR are triggered at the same instant and their ECHO pulses
+  // are captured independently by interrupts.
+  float frontCm = -1.0f;
+  float rearCm = -1.0f;
+  readBothUltrasonicSimultaneously(frontCm, rearCm);
 
   char packet[128];
   snprintf(packet, sizeof(packet),
@@ -444,6 +516,10 @@ void setup() {
   digitalWrite(FRONT_TRIG_PIN, LOW);
   digitalWrite(REAR_TRIG_PIN, LOW);
 
+  // Capture both echo signals independently. No pulseIn() blocking.
+  attachInterrupt(digitalPinToInterrupt(FRONT_ECHO_PIN), frontEchoISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(REAR_ECHO_PIN), rearEchoISR, CHANGE);
+
   // PCA9685 + haptics
   configurePCA9685();
 
@@ -466,9 +542,8 @@ void loop() {
     connectWiFi();
   }
 
-  // Local haptic pattern. Ultrasonic reads are bounded and the rear sensor
-  // gets one quick retry after a missed echo, so a temporary rear timeout
-  // does not turn into a prolonged apparent sensor outage.
+  // Local haptic pattern. Ultrasonic FRONT + REAR are captured concurrently,
+  // so one sensor never waits for the other sensor to finish.
   if (millis() - lastPatternMs >= 20) {
     lastPatternMs = millis();
     applyPattern();
